@@ -27,8 +27,10 @@ const (
 	// MinFrame is the smallest thing that can be an Ethernet frame: two MAC
 	// addresses and an EtherType.
 	MinFrame = 14
-	// MaxFrame is the largest frame that can be transmitted. It matches the
-	// biggest UMEM frame Wireblast will configure.
+	// MaxFrame is the largest frame that can be transmitted. A UMEM frame is
+	// at most a page, so anything above that is chained across several; this
+	// stays comfortably inside how many frames one packet may span, and
+	// preflight rejects a capture that does not.
 	MaxFrame = 16384
 	// MaxPackets bounds how many frames a capture may hold, so pointing
 	// Wireblast at a capture with millions of tiny records fails politely

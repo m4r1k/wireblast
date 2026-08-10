@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,14 @@ const (
 	// enough to amortise the ring bookkeeping and the rate limiter's mutex,
 	// small enough that a rate change or a stop is noticed promptly.
 	txBatch = 256
+
+	// jumboTxBatch is txBatch for the multi-buffer path, which stages packets
+	// in a buffer of batch x maxFrame bytes per queue. At a 9018-byte MTU the
+	// full txBatch would be 2.3 MiB a queue, so use a smaller batch: jumbo
+	// packet rates are two orders of magnitude below minimum-size rates, and
+	// even one queue saturating 100G only needs a few tens of thousands of
+	// batches a second.
+	jumboTxBatch = 32
 
 	// rxPollTimeout bounds a blocking receive so cancellation is seen quickly.
 	rxPollTimeout = 200 * time.Millisecond
@@ -52,6 +61,10 @@ type Info struct {
 	Filter    string
 	FrameSize int
 	NumFrames int
+	// MultiBuffer is true when packets are chained across several UMEM frames,
+	// which is how jumbo frames are carried. Worth showing: it is also why a
+	// jumbo run may report copy rather than zero-copy.
+	MultiBuffer bool
 	// Tuning is what the library did to the interface's NAPI settings to make
 	// the receive path keep up, e.g. "defer=2 flush=200ms", or "untuned". These
 	// are host settings the library restores on close; worth showing.
@@ -77,6 +90,9 @@ func (i Info) String() string {
 		zc = "zero-copy"
 	}
 	s := fmt.Sprintf("%s: %d queue(s), %s, %s XDP", i.Interface, i.Queues, zc, i.XDPMode)
+	if i.MultiBuffer {
+		s += ", multi-buffer"
+	}
 	if i.Driver != "" {
 		s += ", driver " + i.Driver
 	}
@@ -110,6 +126,9 @@ type Runner struct {
 	numFrames int
 	frameSize int
 	maxFrame  int
+	// multiBuffer is set when the largest packet does not fit one UMEM frame
+	// and has to be chained across several. See multiBufferFor.
+	multiBuffer bool
 
 	// frames is the loaded PCAP, nil for generated traffic.
 	frames generator.FrameSource
@@ -209,6 +228,7 @@ func New(cfg *config.Config, res *discovery.Resolved, opts Options) (*Runner, er
 		r.maxFrame = mtu + 18
 	}
 	r.frameSize = orDefault(opts.FrameSize, frameSizeFor(r.maxFrame, res.Link.Driver))
+	r.multiBuffer = multiBufferFor(r.maxFrame, r.frameSize)
 
 	r.limiter = rate.New(cfg.PPS, cfg.BPS, rate.WithBatch(txBatch))
 	statsOpts := []stats.Option{}
@@ -225,6 +245,7 @@ func New(cfg *config.Config, res *discovery.Resolved, opts Options) (*Runner, er
 		NumFrames:   r.numFrames,
 		Pattern:     string(cfg.Mode),
 		PacketSizes: sizes,
+		MultiBuffer: r.multiBuffer,
 	}
 	return r, nil
 }
@@ -236,10 +257,15 @@ func orDefault(v, def int) int {
 	return def
 }
 
-// frameSizeFor picks a UMEM frame size that holds the largest packet. 2048 is
-// the library default and covers everything up to a standard Ethernet frame;
-// jumbo traffic needs page-sized frames, which are also what zero-copy wants
-// on drivers that require them.
+// frameSizeFor picks a UMEM frame size. 2048 is the library default and covers
+// everything up to a standard Ethernet frame; anything larger gets a full page.
+//
+// A page is the ceiling, not a preference. An aligned-chunk UMEM must satisfy
+// XDP_UMEM_MIN_CHUNK_SIZE (2048) <= chunk_size <= PAGE_SIZE, and go-afxdp never
+// sets XDP_UMEM_UNALIGNED_CHUNK_FLAG, so asking for more makes XDP_UMEM_REG
+// fail with a bare EINVAL. Frames therefore do not grow to fit a jumbo packet.
+// Packets bigger than one frame span several, which is what multiBufferFor
+// below decides.
 //
 // AWS ENA's zero-copy datapath needs page-sized (4096) frames; with the default
 // 2048 the bind silently falls back to native copy. So floor at 4096 on ena,
@@ -247,17 +273,43 @@ func orDefault(v, def int) int {
 // with what the driver actually binds. Scoped to ena; other drivers keep the
 // smaller, more cache-friendly frames.
 func frameSizeFor(maxFrame int, driver string) int {
-	size := 32768
-	for _, n := range []int{2048, 4096, 8192, 16384} {
-		if maxFrame <= n {
-			size = n
-			break
-		}
-	}
-	if driver == "ena" && size < 4096 {
+	size := 2048
+	if maxFrame > size || driver == "ena" {
 		size = 4096
 	}
+	// Every Linux architecture pages at 4 KiB or more, so this never bites in
+	// practice. It is here so the kernel's ceiling is expressed in the code
+	// rather than assumed.
+	if page := os.Getpagesize(); size > page {
+		size = page
+	}
 	return size
+}
+
+// multiBufferFor reports whether packets have to span several UMEM frames.
+//
+// This is the jumbo path: the socket binds with XDP_USE_SG and the XDP program
+// loads with BPF_F_XDP_HAS_FRAGS, so a packet arrives as a chain of descriptors
+// instead of being dropped for not fitting. It costs zero-copy on any device
+// reporting xdp-zc-max-segs = 1, and the transmit side has to build through a
+// staging buffer, so it stays off unless the traffic actually needs it.
+func multiBufferFor(maxFrame, frameSize int) bool {
+	return maxFrame > frameSize
+}
+
+// maxTxSegs is how many UMEM frames one transmitted packet may span. It mirrors
+// the limit go-afxdp enforces, which in turn comes from the kernel building an
+// skb of at most CONFIG_MAX_SKB_FRAGS + 1 buffers. Kept here so preflight can
+// reject an impossible size with an explanation instead of letting the transmit
+// loop fail on every batch.
+const maxTxSegs = 18
+
+// framesPerPacket is how many UMEM frames the largest packet occupies.
+func framesPerPacket(maxFrame, frameSize int) int {
+	if maxFrame <= 0 || frameSize <= 0 {
+		return 1
+	}
+	return (maxFrame + frameSize - 1) / frameSize
 }
 
 // buildGenerators makes one generator per queue.
@@ -294,6 +346,7 @@ func (r *Runner) Preflight(src discovery.Source) *Preflight {
 		MaxFrameLen: r.maxFrame,
 		NumFrames:   r.numFrames,
 		FrameSize:   r.frameSize,
+		MultiBuffer: r.multiBuffer,
 		AllLinks:    links,
 	})
 }
@@ -499,12 +552,13 @@ func (r *Runner) Run(ctx context.Context) error {
 func (r *Runner) fleetKey() fleetKey {
 	o := r.umemOptions()
 	return fleetKey{
-		iface:     r.res.Link.Name,
-		queues:    r.queues,
-		filter:    r.plan.Summary,
-		numFrames: o.NumFrames,
-		frameSize: o.FrameSize,
-		receives:  r.plan.Receives(),
+		iface:       r.res.Link.Name,
+		queues:      r.queues,
+		filter:      r.plan.Summary,
+		numFrames:   o.NumFrames,
+		frameSize:   o.FrameSize,
+		receives:    r.plan.Receives(),
+		multiBuffer: r.multiBuffer,
 	}
 }
 
@@ -575,6 +629,12 @@ func (r *Runner) attach() error {
 			// Without need-wakeup a starved driver spins in ksoftirqd instead
 			// of parking, burning cores while forwarding nothing.
 			afxdp.WithNeedWakeup(),
+		}
+		if r.multiBuffer {
+			// Packets bigger than a frame have to chain across several. This
+			// also lets the program attach at a jumbo MTU on drivers that
+			// otherwise cap XDP to a single buffer.
+			opts = append(opts, afxdp.WithMultiBuffer())
 		}
 		if r.plan.KeepManagement {
 			// Spare ARP, ND, SSH and DNS from the match-all redirect so the box

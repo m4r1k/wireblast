@@ -165,6 +165,11 @@ func (m model) dashHeader(s *stats.Snapshot) string {
 	}
 	iface := fmt.Sprintf("%s · %d queue(s) · %s XDP · %s",
 		driverOr(i.Driver), i.Queues, i.XDPMode, zc)
+	if i.MultiBuffer {
+		// Worth showing next to the copy/zero-copy word, since chaining is
+		// usually the reason a jumbo run reports copy.
+		iface += " · multi-buffer"
+	}
 	if i.Tuning != "" && i.Tuning != "untuned" {
 		iface += " · napi " + i.Tuning
 	}

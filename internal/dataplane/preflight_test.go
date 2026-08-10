@@ -148,6 +148,45 @@ func TestFrameSizeAndMTUChecks(t *testing.T) {
 		t.Error("the frame-capacity check did not fire")
 	}
 
+	// ...unless the frames are being chained, which is the whole point of
+	// multi-buffer mode. Then it is worth mentioning, not worth refusing.
+	p = RunPreflight(input(func(in *PreflightInput) {
+		in.Res.Link.MTU = 9200 // a jumbo packet needs a jumbo link
+		in.MaxFrameLen = 9014
+		in.FrameSize = 4096
+		in.MultiBuffer = true
+	}))
+	if !p.OK() {
+		t.Fatalf("a chained jumbo packet must be allowed: %v", p.Err())
+	}
+	if find(p, "larger than an AF_XDP frame") != nil {
+		t.Error("the frame-capacity check must not fire when frames are chained")
+	}
+	c := find(p, "chained across buffers")
+	if c == nil {
+		t.Fatal("chaining should be reported")
+	}
+	if c.Level != LevelInfo {
+		t.Errorf("chaining is informational, got level %v", c.Level)
+	}
+	if !strings.Contains(c.Detail, "3 frames") {
+		t.Errorf("the detail should say how many frames a packet spans: %s", c.Detail)
+	}
+
+	// There is still a ceiling: a packet may only span so many frames.
+	p = RunPreflight(input(func(in *PreflightInput) {
+		in.Res.Link.MTU = 1 << 20 // isolate the chain limit from the MTU check
+		in.MaxFrameLen = (maxTxSegs + 1) * 4096
+		in.FrameSize = 4096
+		in.MultiBuffer = true
+	}))
+	if p.OK() {
+		t.Fatal("a packet needing more frames than one may span must be refused")
+	}
+	if find(p, "too large to chain") == nil {
+		t.Error("the chain-length check did not fire")
+	}
+
 	// A packet larger than the MTU is refused, with the interface's own number
 	// in the message.
 	p = RunPreflight(input(func(in *PreflightInput) {
@@ -157,7 +196,7 @@ func TestFrameSizeAndMTUChecks(t *testing.T) {
 	if p.OK() {
 		t.Fatal("a packet larger than the MTU must be refused")
 	}
-	c := find(p, "MTU")
+	c = find(p, "MTU")
 	if c == nil {
 		t.Fatal("the MTU check did not fire")
 	}

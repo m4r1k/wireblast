@@ -192,6 +192,9 @@ type PreflightInput struct {
 	MaxFrameLen int
 	NumFrames   int
 	FrameSize   int
+	// MultiBuffer is set when a packet is carried as a chain of UMEM frames
+	// rather than having to fit in one.
+	MultiBuffer bool
 	// AllLinks is every interface on the host, used to place the SSH session.
 	AllLinks []discovery.Link
 }
@@ -235,11 +238,28 @@ func RunPreflight(in PreflightInput) *Preflight {
 	}
 
 	// Frame size against the interface MTU and the UMEM frame capacity.
-	if in.MaxFrameLen > in.FrameSize {
+	//
+	// A UMEM frame cannot be grown to fit a jumbo packet: the kernel caps an
+	// aligned chunk at a page. Packets larger than a frame are chained across
+	// several instead, which is what multi-buffer mode is for. So the real
+	// ceiling is how many frames one packet may span.
+	switch frames := framesPerPacket(in.MaxFrameLen, in.FrameSize); {
+	case frames > 1 && !in.MultiBuffer:
 		add(LevelFatal, "packets are larger than an AF_XDP frame",
-			fmt.Sprintf("the largest packet is %d bytes but each UMEM frame holds %d.",
-				in.MaxFrameLen, in.FrameSize),
+			fmt.Sprintf("the largest packet is %d bytes but each UMEM frame holds %d, and this "+
+				"run is not chaining frames.", in.MaxFrameLen, in.FrameSize),
 			"Use a smaller --packet-size, or a capture with smaller packets.")
+	case frames > maxTxSegs:
+		add(LevelFatal, "packets are too large to chain",
+			fmt.Sprintf("the largest packet is %d bytes, which needs %d frames of %d, more than "+
+				"the %d a single packet may span.", in.MaxFrameLen, frames, in.FrameSize, maxTxSegs),
+			"Use a smaller --packet-size, or a capture with smaller packets.")
+	case frames > 1:
+		add(LevelInfo, "jumbo frames are chained across buffers",
+			fmt.Sprintf("the largest packet is %d bytes and each UMEM frame holds %d, so a packet "+
+				"spans up to %d frames.", in.MaxFrameLen, in.FrameSize, frames),
+			"Chaining needs the driver to accept an XDP_USE_SG bind. Where it will not do that in "+
+				"zero-copy mode the run falls back to copy mode, which the startup line reports.")
 	}
 	// The MTU bounds what may be *sent*. A run that transmits nothing is not
 	// constrained by it — it just has to have frames big enough to receive
