@@ -69,6 +69,10 @@ func (w *Writer) Final(s *stats.Snapshot) error {
 		r.KernelTXDescriptors = q.TxPackets
 		r.RXDropped = q.RxDropped
 		r.RXRingFull = q.RxRingFull
+		r.RXFillRingEmpty = q.RxFillRingEmpty
+		r.RXInvalidDescs = q.RxInvalidDescs
+		r.TXInvalidDescs = q.TxInvalidDescs
+		r.TXRingEmpty = q.TxRingEmpty
 		if err := w.write(r); err != nil {
 			return err
 		}

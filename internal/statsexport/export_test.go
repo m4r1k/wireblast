@@ -32,7 +32,8 @@ func fixture() *stats.Snapshot {
 			RxDropped: 3, RxRingFull: 8, RxFillRingEmpty: 9,
 			RxInvalidDescs: 4, TxInvalidDescs: 7, TxRingEmpty: 6,
 			PerQueue: []stats.KernelQueue{
-				{Queue: 0, RxPackets: 50, TxPackets: 60, RxDropped: 1, RxRingFull: 2},
+				{Queue: 0, RxPackets: 50, TxPackets: 60, RxDropped: 1, RxRingFull: 2,
+					RxFillRingEmpty: 3, RxInvalidDescs: 4, TxInvalidDescs: 5, TxRingEmpty: 6},
 				{Queue: 1, RxPackets: 30, TxPackets: 40, RxDropped: 2, RxRingFull: 6},
 			},
 		},
@@ -74,6 +75,10 @@ func TestCSVWritesStableAggregateAndQueueRecords(t *testing.T) {
 	assertCSV(t, header, rows[2], "record_type", "final")
 	assertCSV(t, header, rows[3], "record_type", "queue_final")
 	assertCSV(t, header, rows[3], "queue_id", "0")
+	assertCSV(t, header, rows[3], "rx_fill_ring_empty_descs", "3")
+	assertCSV(t, header, rows[3], "rx_invalid_descs", "4")
+	assertCSV(t, header, rows[3], "tx_invalid_descs", "5")
+	assertCSV(t, header, rows[3], "tx_ring_empty_descs", "6")
 	assertCSV(t, header, rows[4], "queue_id", "1")
 }
 
