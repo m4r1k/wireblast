@@ -27,6 +27,11 @@ type fleetKey struct {
 	// receives changes the frame split between the transmit and receive pools
 	// and the ring depths, so it is part of the bind too.
 	receives bool
+	// multiBuffer is a bind flag (XDP_USE_SG) and a program flag
+	// (BPF_F_XDP_HAS_FRAGS), so it cannot be changed on an attached fleet. It
+	// needs its own field because frameSize does not imply it: at 4096-byte
+	// frames a 4100-byte run chains nothing and a 9000-byte run chains.
+	multiBuffer bool
 }
 
 // Session keeps an AF_XDP fleet attached across several runs.
