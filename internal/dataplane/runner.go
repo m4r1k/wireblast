@@ -890,11 +890,15 @@ func (r *Runner) readKernel() (stats.Kernel, error) {
 	}
 	for q, s := range fs.PerQueue {
 		k.PerQueue = append(k.PerQueue, stats.KernelQueue{
-			Queue:      q,
-			RxPackets:  s.Received,
-			TxPackets:  s.Transmitted,
-			RxDropped:  s.KernelStats.Rx_dropped,
-			RxRingFull: s.KernelStats.Rx_ring_full,
+			Queue:           q,
+			RxPackets:       s.Received,
+			TxPackets:       s.Transmitted,
+			RxDropped:       s.KernelStats.Rx_dropped,
+			RxRingFull:      s.KernelStats.Rx_ring_full,
+			RxFillRingEmpty: s.KernelStats.Rx_fill_ring_empty_descs,
+			RxInvalidDescs:  s.KernelStats.Rx_invalid_descs,
+			TxInvalidDescs:  s.KernelStats.Tx_invalid_descs,
+			TxRingEmpty:     s.KernelStats.Tx_ring_empty_descs,
 		})
 	}
 	return k, nil
@@ -918,38 +922,7 @@ func closedSocket(err error) bool {
 // baseline still holds the old totals; clamping at zero keeps that transition
 // from producing nonsense.
 func subtractKernel(a, b stats.Kernel) stats.Kernel {
-	sub := func(x, y uint64) uint64 {
-		if x < y {
-			return 0
-		}
-		return x - y
-	}
-	out := stats.Kernel{
-		Queues:          a.Queues,
-		RxPackets:       sub(a.RxPackets, b.RxPackets),
-		TxPackets:       sub(a.TxPackets, b.TxPackets),
-		RxDropped:       sub(a.RxDropped, b.RxDropped),
-		RxRingFull:      sub(a.RxRingFull, b.RxRingFull),
-		RxFillRingEmpty: sub(a.RxFillRingEmpty, b.RxFillRingEmpty),
-		RxInvalidDescs:  sub(a.RxInvalidDescs, b.RxInvalidDescs),
-		TxInvalidDescs:  sub(a.TxInvalidDescs, b.TxInvalidDescs),
-		TxRingEmpty:     sub(a.TxRingEmpty, b.TxRingEmpty),
-		PerQueue:        make([]stats.KernelQueue, 0, len(a.PerQueue)),
-	}
-	for i, q := range a.PerQueue {
-		base := stats.KernelQueue{}
-		if i < len(b.PerQueue) {
-			base = b.PerQueue[i]
-		}
-		out.PerQueue = append(out.PerQueue, stats.KernelQueue{
-			Queue:      q.Queue,
-			RxPackets:  sub(q.RxPackets, base.RxPackets),
-			TxPackets:  sub(q.TxPackets, base.TxPackets),
-			RxDropped:  sub(q.RxDropped, base.RxDropped),
-			RxRingFull: sub(q.RxRingFull, base.RxRingFull),
-		})
-	}
-	return out
+	return a.Since(b)
 }
 
 // nextPow2 rounds up to a power of two, which is what the frame region wants.

@@ -1192,3 +1192,31 @@ func TestToggleProblemsKey(t *testing.T) {
 		t.Error("w again should hide them")
 	}
 }
+
+func TestDashboardShowsTypedAFXDPDiagnostics(t *testing.T) {
+	s := &stats.Snapshot{
+		At:            time.Unix(10, 0),
+		IntervalSince: time.Unix(0, 0),
+		KernelInterval: stats.Kernel{
+			RxDropped: 10, RxRingFull: 20, RxInvalidDescs: 30,
+			TxInvalidDescs: 40, RxFillRingEmpty: 50, TxRingEmpty: 60,
+		},
+	}
+	m := model{}
+	compact := m.dashDiagnostics(s)
+	for _, want := range []string{"AF_XDP", "drops 100", "ring starvation 110", "w to show"} {
+		if !strings.Contains(compact, want) {
+			t.Errorf("compact diagnostics missing %q:\n%s", want, compact)
+		}
+	}
+	m.showProblems = true
+	expanded := m.dashDiagnostics(s)
+	for _, want := range []string{
+		"rx_dropped", "rx_ring_full", "rx_invalid_descs", "tx_invalid_descs",
+		"rx_fill_ring_empty_descs", "tx_ring_empty_descs", "/s",
+	} {
+		if !strings.Contains(expanded, want) {
+			t.Errorf("expanded diagnostics missing %q:\n%s", want, expanded)
+		}
+	}
+}

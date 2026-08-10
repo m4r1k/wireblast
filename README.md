@@ -116,6 +116,20 @@ sudo wireblast -i wb0 --dst-ip 10.99.0.2 --packet-size 512 --pps 100k -d 10s
 
 The [namespace lab guide](https://wireblast.mintlify.site/guides/namespace-lab) builds this out into a full sender and receiver.
 
+### AF_XDP diagnostics
+
+The dashboard keeps packet drops and ring-starvation events separate. Press
+`w` during a run to expand the compact AF_XDP line into all six Linux
+`XDP_STATISTICS` counters, with exact UAPI names, counts, rates, meanings and
+per-queue details. The final summary prints the same counter taxonomy for
+unattended `--no-tui` runs.
+
+`rx_dropped`, `rx_ring_full`, `rx_invalid_descs` and `tx_invalid_descs` report
+drops. `rx_fill_ring_empty_descs` and `tx_ring_empty_descs` report failed ring
+retrievals: useful signs of starvation, but not packet-loss counts. See the
+[Linux AF_XDP documentation](https://docs.kernel.org/networking/af_xdp.html)
+and [`struct xdp_statistics`](https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_xdp.h).
+
 ## Examples
 
 The [`examples/`](examples) directory has 20 runnable examples, simplest to most advanced, each with a short README and a shell script driven by environment variables:
