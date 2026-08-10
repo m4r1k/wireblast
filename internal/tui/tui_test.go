@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/atoonk/wireblast/internal/config"
+	"github.com/atoonk/wireblast/internal/dataplane"
 	"github.com/atoonk/wireblast/internal/discovery"
 	"github.com/atoonk/wireblast/internal/stats"
 )
@@ -1217,6 +1218,24 @@ func TestDashboardShowsTypedAFXDPDiagnostics(t *testing.T) {
 	} {
 		if !strings.Contains(expanded, want) {
 			t.Errorf("expanded diagnostics missing %q:\n%s", want, expanded)
+		}
+	}
+}
+
+func TestDashboardShowsExactNativeAttemptErrorAfterGenericFallback(t *testing.T) {
+	m := newTestModel(t, nil)
+	m.cfg.Mode = config.ModeReceive
+	nativeErr := "afxdp: could not open eth0 (8 queues): native bind: operation not supported"
+	view := m.dashHeaderWithInfo(&stats.Snapshot{}, dataplane.Info{
+		Interface:          "eth0",
+		Driver:             "ixgbe",
+		Queues:             8,
+		XDPMode:            "generic",
+		NativeAttemptError: nativeErr,
+	})
+	for _, want := range []string{"generic XDP", "native AF_XDP attempt failed", nativeErr} {
+		if !strings.Contains(view, want) {
+			t.Errorf("dashboard header is missing %q:\n%s", want, view)
 		}
 	}
 }

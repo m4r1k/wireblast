@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/atoonk/wireblast/internal/config"
+	"github.com/atoonk/wireblast/internal/dataplane"
 	"github.com/atoonk/wireblast/internal/stats"
 )
 
@@ -132,7 +133,10 @@ func (m model) graphLabel() string {
 }
 
 func (m model) dashHeader(s *stats.Snapshot) string {
-	i := m.runner.Info()
+	return m.dashHeaderWithInfo(s, m.runner.Info())
+}
+
+func (m model) dashHeaderWithInfo(s *stats.Snapshot, i dataplane.Info) string {
 	var b strings.Builder
 
 	state := styleOK.Render("running")
@@ -180,6 +184,9 @@ func (m model) dashHeader(s *stats.Snapshot) string {
 		iface += fmt.Sprintf(" · link back in %.1fs", i.LinkWait.Seconds())
 	}
 	line("interface", fmt.Sprintf("%s  %s", i.Interface, styleFaint.Render(iface)))
+	if i.NativeAttemptError != "" {
+		line("fallback", styleWarn.Render("native AF_XDP attempt failed: "+i.NativeAttemptError))
+	}
 	line("pattern", fmt.Sprintf("%s  %s", i.Pattern, styleFaint.Render(i.PacketSizes)))
 	line("rx filter", i.Filter)
 
