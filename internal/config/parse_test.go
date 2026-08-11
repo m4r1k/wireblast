@@ -77,6 +77,69 @@ func TestParseBPS(t *testing.T) {
 	}
 }
 
+func TestParseSize(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    uint64
+		wantErr bool
+	}{
+		{"1073741824", 1 << 30, false},
+		{"512M", 512 << 20, false},
+		{"512m", 512 << 20, false},
+		{"4G", 4 << 30, false},
+		{"4g", 4 << 30, false},
+		{"4GB", 4 << 30, false},
+		{"4GiB", 4 << 30, false},
+		{"4096MB", 4096 << 20, false},
+		{"1.5G", 3 << 29, false},
+		{"2T", 2 << 40, false},
+		{"64k", 64 << 10, false},
+		{" 4G ", 4 << 30, false},
+		{"100", 100, false},
+		// Sizes have no "unlimited": a budget of nothing is not a budget.
+		{"0", 0, true},
+		{"unlimited", 0, true},
+		{"max", 0, true},
+		{"", 0, true},
+		{"-1G", 0, true},
+		{"xyz", 0, true},
+		{"1X", 0, true},
+		{"99999999999999999999", 0, true}, // exceeds uint64 on its own
+		{"18446744073t", 0, true},         // fits uint64 until the multiplier
+		{"1e40", 0, true},                 // float path overflow
+	}
+	for _, tt := range tests {
+		got, err := ParseSize(tt.in)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("ParseSize(%q) error = %v, wantErr %v", tt.in, err, tt.wantErr)
+			continue
+		}
+		if err == nil && got != tt.want {
+			t.Errorf("ParseSize(%q) = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestFormatSize(t *testing.T) {
+	tests := []struct {
+		in   uint64
+		want string
+	}{
+		{1 << 30, "1G"},
+		{512 << 20, "512M"},
+		{4 << 30, "4G"},
+		{3 << 29, "1.5G"},
+		{2 << 40, "2T"},
+		{64 << 10, "64k"},
+		{100, "100"},
+	}
+	for _, tt := range tests {
+		if got := FormatSize(tt.in); got != tt.want {
+			t.Errorf("FormatSize(%d) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestFormatRates(t *testing.T) {
 	tests := []struct {
 		pps  uint64

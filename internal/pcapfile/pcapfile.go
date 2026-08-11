@@ -14,12 +14,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/gopacket/gopacket/pcapgo"
+
+	"github.com/atoonk/wireblast/internal/config"
 )
 
 // Limits on what will be loaded.
@@ -32,27 +35,33 @@ const (
 	// stays comfortably inside how many frames one packet may span, and
 	// preflight rejects a capture that does not.
 	MaxFrame = 16384
-	// MaxPackets bounds how many frames a capture may hold, so pointing
-	// Wireblast at a capture with millions of tiny records fails politely
-	// instead of exhausting the machine.
-	MaxPackets = 2_000_000
+	// DefaultMaxBytes is the memory budget a capture may occupy when the
+	// caller does not choose one. The whole capture is held in RAM (which this
+	// runs as root on), so an unbounded load could OOM the host before the NIC
+	// is ever touched; anyone with more memory can raise the budget with
+	// --pcap-memory.
+	DefaultMaxBytes = 1 << 30 // 1 GiB
+	// recordBytes is what one index entry costs against the budget. A test
+	// asserts it matches unsafe.Sizeof(record{}), so the accounting cannot
+	// drift from the real struct. Charging the index means the budget also
+	// bounds packet count: a capture of nothing but minimum-size frames costs
+	// MinFrame+recordBytes per packet.
+	recordBytes = 24
 )
 
-// maxLoadBytes bounds the total bytes a capture may occupy in memory. The
-// per-frame and per-count limits above are not enough on their own: two million
-// maximum-size frames would be tens of gigabytes, enough to OOM the host (which
-// this runs as root on) before the NIC is ever touched.
-//
-// It must stay below 1<<32: record offsets are stored as uint32, so a total
-// under 4 GiB is what guarantees they can never wrap. A var rather than a const
-// only so a test can lower it.
-var maxLoadBytes = 1 << 30 // 1 GiB
+// Limits is what the caller allows Load to hold in memory. The zero value
+// means the defaults.
+type Limits struct {
+	// MaxBytes is the memory budget for the capture, counting frame bytes and
+	// the per-frame index. Zero means DefaultMaxBytes.
+	MaxBytes uint64
+}
 
-// record is one frame's place in the flat backing store. off and len are
-// uint32 to keep the index compact for a multi-million-record capture; the
-// maxLoadBytes cap (kept below 4 GiB) is what guarantees neither can wrap.
+// record is one frame's place in the flat backing store. len fits a uint32
+// because no frame exceeds MaxFrame; off is a uint64 so a raised memory
+// budget can hold captures past 4 GiB.
 type record struct {
-	off uint32
+	off uint64
 	len uint32
 	// gap is the time between the previous frame and this one, as the capture
 	// recorded it. Zero for the first frame.
@@ -82,7 +91,15 @@ type File struct {
 }
 
 // Load reads and validates a capture file.
-func Load(path string) (*File, error) {
+func Load(path string, lim Limits) (*File, error) {
+	maxBytes := lim.MaxBytes
+	if maxBytes == 0 {
+		maxBytes = DefaultMaxBytes
+	}
+	// Slice lengths are ints, so on a 32-bit platform the budget can never
+	// exceed what a slice can address anyway.
+	maxBytes = min(maxBytes, math.MaxInt)
+
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open capture: %w", err)
@@ -101,9 +118,19 @@ func Load(path string) (*File, error) {
 	}
 
 	out := &File{path: path, minLen: MaxFrame + 1}
+	var fileSize int64
+	if st, err := f.Stat(); err == nil {
+		fileSize = st.Size()
+	}
+	// The file size is a close overestimate of the frame bytes (per-record
+	// headers and all), so growing the store by append would peak at roughly
+	// twice the final size for nothing. Reserve once up front instead.
+	if fileSize > 0 {
+		out.data = make([]byte, 0, min(uint64(fileSize), maxBytes))
+	}
 	var first, prev time.Time
 	for i := 0; ; i++ {
-		data, ci, err := src.ReadPacketData()
+		data, ci, err := src.ZeroCopyReadPacketData()
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -116,14 +143,11 @@ func Load(path string) (*File, error) {
 			}
 			return nil, fmt.Errorf("%s: reading packet %d: %w", path, i+1, err)
 		}
-		if len(out.recs) >= MaxPackets {
-			return nil, fmt.Errorf("%s holds more than %d packets, which is more than Wireblast "+
-				"will load into memory. Trim it with `editcap -c %d`", path, MaxPackets, MaxPackets)
-		}
-		if len(out.data)+len(data) > maxLoadBytes {
-			return nil, fmt.Errorf("%s would load more than %d bytes into memory, more than "+
-				"Wireblast will hold. Trim it with `editcap -c N` to keep fewer packets",
-				path, maxLoadBytes)
+		if uint64(len(out.data)+len(data))+uint64(len(out.recs)+1)*recordBytes > maxBytes {
+			return nil, fmt.Errorf("%s needs more than %s of memory to load (frame bytes plus "+
+				"index). Raise the budget with --pcap-memory %s, or trim the capture with "+
+				"`editcap -c N` to keep fewer packets",
+				path, config.FormatSize(maxBytes), config.FormatSize(suggestBudget(fileSize, maxBytes)))
 		}
 
 		switch {
@@ -151,7 +175,7 @@ func Load(path string) (*File, error) {
 			prev = ci.Timestamp
 		}
 
-		out.recs = append(out.recs, record{off: uint32(len(out.data)), len: uint32(len(data)), gap: gap})
+		out.recs = append(out.recs, record{off: uint64(len(out.data)), len: uint32(len(data)), gap: gap})
 		out.data = append(out.data, data...)
 		out.minLen = min(out.minLen, len(data))
 		out.maxLen = max(out.maxLen, len(data))
@@ -165,6 +189,22 @@ func Load(path string) (*File, error) {
 	}
 	out.meanLen = len(out.data) / len(out.recs)
 	return out, nil
+}
+
+// suggestBudget picks a clean power-of-two budget the failed capture should
+// fit inside, for the over-budget error message.
+func suggestBudget(fileSize int64, maxBytes uint64) uint64 {
+	// The index costs a little more per record than the pcap's own framing, so
+	// 1.3x the file size covers even a capture of minimum-size frames.
+	need := maxBytes * 2
+	if fileSize > 0 {
+		need = uint64(float64(fileSize) * 1.3)
+	}
+	s := uint64(1) << 20
+	for s < need && s < 1<<62 {
+		s <<= 1
+	}
+	return s
 }
 
 // openReader picks the pcap or pcapng reader by sniffing the file's magic.
@@ -189,9 +229,13 @@ func openReader(r *bufio.Reader, path string) (packetReader, layers.LinkType, er
 	return pr, pr.LinkType(), nil
 }
 
-// packetReader is the bit of pcapgo's readers Wireblast uses.
+// packetReader is the bit of pcapgo's readers Wireblast uses. The zero-copy
+// variant returns a slice into the reader's own buffer, valid only until the
+// next call; Load copies every frame into its contiguous store immediately, so
+// nothing is retained, and a multi-gigabyte capture does not churn a second
+// capture's worth of per-packet garbage through the heap.
 type packetReader interface {
-	ReadPacketData() ([]byte, gopacket.CaptureInfo, error)
+	ZeroCopyReadPacketData() ([]byte, gopacket.CaptureInfo, error)
 }
 
 // Len is how many frames the capture holds.
@@ -201,7 +245,7 @@ func (f *File) Len() int { return len(f.recs) }
 // returned slice aliases the backing store and must not be modified.
 func (f *File) Frame(i int) ([]byte, time.Duration) {
 	r := f.recs[i]
-	return f.data[r.off : r.off+r.len], r.gap
+	return f.data[r.off : r.off+uint64(r.len)], r.gap
 }
 
 // MaxLen is the largest frame in the capture, in bytes.

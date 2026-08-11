@@ -192,13 +192,26 @@ func TestEveryConfigFieldHasAFlag(t *testing.T) {
 		"packet-size", "vlan", "ethertype", "payload-byte",
 		"duration", "pps", "bps", "queues",
 		"rx-mode", "rx-port", "rx-cidr",
-		"pcap", "pcap-timing", "pcap-loop",
+		"pcap", "pcap-timing", "pcap-loop", "pcap-memory",
 		"no-tui", "start", "yes", "allow-match-all", "forget",
 	}
 	for _, name := range want {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Errorf("missing --%s flag", name)
 		}
+	}
+}
+
+func TestPcapMemoryFlag(t *testing.T) {
+	got, err := parse(t, "--pcap", "x.pcap", "--pcap-memory", "4G")
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got.PCAPMemory != 4<<30 {
+		t.Errorf("PCAPMemory = %d, want %d", got.PCAPMemory, uint64(4<<30))
+	}
+	if _, err := parse(t, "--pcap-memory", "banana"); err == nil {
+		t.Error("a nonsense size should fail")
 	}
 }
 

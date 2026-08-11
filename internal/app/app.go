@@ -63,7 +63,7 @@ func Prepare(cfg *config.Config, opts PrepareOptions) (*Prepared, error) {
 	// broken file should never cost you a link bounce.
 	var frames generator.FrameSource
 	if cfg.Mode == config.ModePCAP {
-		f, err := pcapfile.Load(cfg.PCAPFile)
+		f, err := pcapfile.Load(cfg.PCAPFile, pcapfile.Limits{MaxBytes: cfg.PCAPMemory})
 		if err != nil {
 			return nil, err
 		}

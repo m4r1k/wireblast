@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/atoonk/wireblast/internal/config"
+	"github.com/atoonk/wireblast/internal/pcapfile"
 )
 
 // fieldKind decides how a field is edited.
@@ -188,6 +189,28 @@ var allFields = []field{
 		show:    func(c *config.Config) bool { return c.Mode == config.ModePCAP },
 		get:     func(c *config.Config) string { return yesNo(c.PCAPLoop) },
 		set:     func(c *config.Config, v string) error { c.PCAPLoop = v == "yes"; return nil },
+	},
+	{
+		key: "pcap-memory", label: "Memory budget",
+		help: "RAM the capture may use when loading, e.g. 512M or 4G",
+		show: func(c *config.Config) bool { return c.Mode == config.ModePCAP },
+		get: func(c *config.Config) string {
+			if c.PCAPMemory == 0 {
+				return config.FormatSize(pcapfile.DefaultMaxBytes)
+			}
+			return config.FormatSize(c.PCAPMemory)
+		},
+		set: func(c *config.Config, v string) error {
+			n, err := config.ParseSize(v)
+			if err != nil {
+				return fmt.Errorf("must be a size like 512M or 4G")
+			}
+			if n < 1<<20 {
+				return fmt.Errorf("must be at least 1M")
+			}
+			c.PCAPMemory = n
+			return nil
+		},
 	},
 	{
 		key: "vlan", label: "VLAN ID", help: "0 sends untagged frames; 1-4094 adds an 802.1Q tag",

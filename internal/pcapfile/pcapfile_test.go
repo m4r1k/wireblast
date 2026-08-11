@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
@@ -110,7 +111,7 @@ func TestLoadEthernetCapture(t *testing.T) {
 		{data: frame(128, 0xa3), at: 25 * time.Millisecond},
 	})
 
-	f, err := Load(path)
+	f, err := Load(path, Limits{})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -161,7 +162,7 @@ func TestLoadPcapng(t *testing.T) {
 		{data: frame(64, 0xb1), at: 0},
 		{data: frame(300, 0xb2), at: 5 * time.Millisecond},
 	})
-	f, err := Load(path)
+	f, err := Load(path, Limits{})
 	if err != nil {
 		t.Fatalf("Load pcapng: %v", err)
 	}
@@ -177,7 +178,7 @@ func TestLoadPcapng(t *testing.T) {
 func TestRejectsNonEthernetLinkTypes(t *testing.T) {
 	for _, lt := range []layers.LinkType{layers.LinkTypeRaw, layers.LinkTypeLinuxSLL} {
 		path := writePcap(t, lt, []capPacket{{data: frame(64, 1)}})
-		_, err := Load(path)
+		_, err := Load(path, Limits{})
 		if err == nil {
 			t.Errorf("link type %v should be rejected", lt)
 			continue
@@ -198,21 +199,21 @@ func TestRejectsMalformedCaptures(t *testing.T) {
 		if err := os.WriteFile(path, []byte("this is not a pcap file at all"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		_, err := Load(path)
+		_, err := Load(path, Limits{})
 		if err == nil || !strings.Contains(err.Error(), "not a readable pcap") {
 			t.Fatalf("error = %v, want a clear 'not a pcap' message", err)
 		}
 	})
 
 	t.Run("missing file", func(t *testing.T) {
-		if _, err := Load(filepath.Join(dir, "nope.pcap")); err == nil {
+		if _, err := Load(filepath.Join(dir, "nope.pcap"), Limits{}); err == nil {
 			t.Fatal("a missing file should fail")
 		}
 	})
 
 	t.Run("empty capture", func(t *testing.T) {
 		path := writePcap(t, layers.LinkTypeEthernet, nil)
-		_, err := Load(path)
+		_, err := Load(path, Limits{})
 		if err == nil || !strings.Contains(err.Error(), "no packets") {
 			t.Fatalf("error = %v, want a 'no packets' message", err)
 		}
@@ -223,7 +224,7 @@ func TestRejectsMalformedCaptures(t *testing.T) {
 			{data: frame(64, 1)},
 			{data: make([]byte, 6)}, // too short to be Ethernet
 		})
-		_, err := Load(path)
+		_, err := Load(path, Limits{})
 		if err == nil {
 			t.Fatal("a 6-byte record should be rejected")
 		}
@@ -239,39 +240,49 @@ func TestRejectsMalformedCaptures(t *testing.T) {
 		path := writePcap(t, layers.LinkTypeEthernet, []capPacket{
 			{data: frame(MaxFrame+1, 1)},
 		})
-		_, err := Load(path)
+		_, err := Load(path, Limits{})
 		if err == nil || !strings.Contains(err.Error(), "larger than") {
 			t.Fatalf("error = %v, want a size-limit message", err)
 		}
 	})
 }
 
-// A capture whose frames are individually legal but sum to more than will fit
-// in memory must be refused up front, not appended until the host OOMs. The
-// byte cap is also what keeps the uint32 record offsets from wrapping.
+// A capture whose frames are individually legal but sum to more than the
+// memory budget must be refused up front, not appended until the host OOMs.
 func TestRejectsOversizedTotal(t *testing.T) {
-	orig := maxLoadBytes
-	defer func() { maxLoadBytes = orig }()
-	maxLoadBytes = 100 // two 64-byte frames already exceed this
-
+	// One 64-byte frame costs 64+recordBytes = 88 against the budget, so 100
+	// holds one frame but not two.
 	path := writePcap(t, layers.LinkTypeEthernet, []capPacket{
 		{data: frame(64, 1)},
 		{data: frame(64, 2)},
 	})
-	_, err := Load(path)
+	_, err := Load(path, Limits{MaxBytes: 100})
 	if err == nil {
-		t.Fatal("a capture larger than the byte cap must be rejected")
+		t.Fatal("a capture larger than the byte budget must be rejected")
 	}
-	for _, want := range []string{"bytes", "editcap"} {
+	for _, want := range []string{"memory", "editcap", "--pcap-memory"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error = %q, should mention %q", err, want)
 		}
 	}
 
+	// The same capture loads once the budget is raised.
+	if _, err := Load(path, Limits{MaxBytes: 200}); err != nil {
+		t.Fatalf("a raised budget must load what a smaller one rejected: %v", err)
+	}
+
 	// A capture that fits still loads.
 	small := writePcap(t, layers.LinkTypeEthernet, []capPacket{{data: frame(64, 1)}})
-	if _, err := Load(small); err != nil {
-		t.Fatalf("a capture within the cap must still load: %v", err)
+	if _, err := Load(small, Limits{MaxBytes: 100}); err != nil {
+		t.Fatalf("a capture within the budget must still load: %v", err)
+	}
+}
+
+// recordBytes is what Load charges the budget per index entry; it must not
+// drift from what a record actually costs.
+func TestRecordBytesMatchesStruct(t *testing.T) {
+	if got := unsafe.Sizeof(record{}); got != recordBytes {
+		t.Fatalf("unsafe.Sizeof(record{}) = %d, but the budget charges recordBytes = %d", got, recordBytes)
 	}
 }
 
@@ -281,7 +292,7 @@ func TestTruncatedFramesAreReported(t *testing.T) {
 		{data: frame(64, 1)},
 		{data: frame(64, 2), origLen: 1514}, // captured 64 of a 1514-byte packet
 	})
-	f, err := Load(path)
+	f, err := Load(path, Limits{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +317,7 @@ func TestOutOfOrderTimestampsGiveNoNegativeGaps(t *testing.T) {
 		{data: frame(64, 2), at: 50 * time.Millisecond}, // earlier than the one before
 		{data: frame(64, 3), at: 150 * time.Millisecond},
 	})
-	f, err := Load(path)
+	f, err := Load(path, Limits{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +338,7 @@ func TestValidationHappensAtLoadTime(t *testing.T) {
 		{data: frame(64, 1)},
 		{data: make([]byte, 3)},
 	})
-	if _, err := Load(path); err == nil {
+	if _, err := Load(path, Limits{}); err == nil {
 		t.Fatal("Load must reject the capture up front, not at transmit time")
 	}
 }
@@ -348,7 +359,7 @@ func BenchmarkFrameLookup(b *testing.B) {
 	}
 	f.Close()
 
-	cap, err := Load(path)
+	cap, err := Load(path, Limits{})
 	if err != nil {
 		b.Fatal(err)
 	}

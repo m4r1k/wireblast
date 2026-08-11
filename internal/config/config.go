@@ -170,6 +170,10 @@ type Config struct {
 	PCAPFile   string
 	PCAPTiming PcapTiming
 	PCAPLoop   bool
+	// PCAPMemory is the memory budget in bytes for loading the capture (frame
+	// bytes plus index). 0 means the 1 GiB default; the whole capture is held
+	// in RAM, so a raised budget has to fit in it.
+	PCAPMemory uint64
 
 	// Front-end and confirmation.
 	NoTUI bool
@@ -334,6 +338,11 @@ func (c *Config) Validate() error {
 		}
 		if c.PCAPTiming != PcapRate && c.PCAPTiming != PcapOriginal {
 			bad("--pcap-timing %q is not one of rate, original", c.PCAPTiming)
+		}
+		// A tiny budget is almost certainly a unit slip ("4" meaning 4 bytes
+		// rather than 4G), so refuse it rather than reject every capture.
+		if c.PCAPMemory != 0 && c.PCAPMemory < 1<<20 {
+			bad("--pcap-memory %d bytes is smaller than 1 MiB; give a size like 512M or 4G", c.PCAPMemory)
 		}
 	}
 
