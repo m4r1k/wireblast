@@ -260,6 +260,7 @@ func Merge(flags config.Config, saved config.Config, changed func(flag string) b
 		{"pcap", func(d *config.Config, s config.Config) { d.PCAPFile = s.PCAPFile }},
 		{"pcap-timing", func(d *config.Config, s config.Config) { d.PCAPTiming = s.PCAPTiming }},
 		{"pcap-loop", func(d *config.Config, s config.Config) { d.PCAPLoop = s.PCAPLoop }},
+		{"pcap-memory", func(d *config.Config, s config.Config) { d.PCAPMemory = s.PCAPMemory }},
 	}
 	for _, f := range fields {
 		if changed(f.flag) {

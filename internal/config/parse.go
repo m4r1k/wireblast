@@ -187,6 +187,100 @@ func FormatBPS(bps uint64) string {
 	return formatSI(float64(bps)) + "bps"
 }
 
+// ParseSize parses a memory size in bytes. It accepts a plain number and the
+// suffixes k/K, m/M, g/G and t/T, optionally followed by "B" or "iB". Unlike
+// ParsePPS and ParseBPS the multipliers are binary (1k = 1024), because memory
+// is quoted in powers of two: the default capture budget is 1<<30, and a
+// decimal "1G" would silently be smaller than that default.
+//
+//	ParseSize("1073741824") == 1 << 30
+//	ParseSize("512M")       == 512 << 20
+//	ParseSize("4G")         == 4 << 30
+//	ParseSize("4GiB")       == 4 << 30
+//	ParseSize("1.5G")       == 3 << 29
+//
+// There is no "unlimited": a size of zero or the unlimited words are errors,
+// because an unbounded load is exactly what a memory budget exists to prevent.
+func ParseSize(s string) (uint64, error) {
+	t := strings.ToLower(strings.TrimSpace(s))
+	if t == "" {
+		return 0, errors.New("empty size value")
+	}
+	if unlimitedWords[t] {
+		return 0, fmt.Errorf("%q is not a size; give a byte count like 512M or 4G", s)
+	}
+	// Strip a trailing unit, longest first so "gib" is consumed before the "g"
+	// multiplier is looked for.
+	for _, u := range []string{"ib", "b"} {
+		if strings.HasSuffix(t, u) {
+			t = strings.TrimSpace(strings.TrimSuffix(t, u))
+			break
+		}
+	}
+	mult := uint64(1)
+	if t != "" {
+		switch t[len(t)-1] {
+		case 'k':
+			mult, t = 1<<10, t[:len(t)-1]
+		case 'm':
+			mult, t = 1<<20, t[:len(t)-1]
+		case 'g':
+			mult, t = 1<<30, t[:len(t)-1]
+		case 't':
+			mult, t = 1<<40, t[:len(t)-1]
+		}
+	}
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return 0, fmt.Errorf("%q is not a size", s)
+	}
+	var n uint64
+	// Integers exactly; anything with a decimal point via float.
+	if !strings.ContainsAny(t, ".eE") {
+		v, err := strconv.ParseUint(t, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%q is not a size", s)
+		}
+		if v > math.MaxUint64/mult {
+			return 0, fmt.Errorf("%q is too large a size", s)
+		}
+		n = v * mult
+	} else {
+		f, err := strconv.ParseFloat(t, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%q is not a size", s)
+		}
+		if f < 0 {
+			return 0, fmt.Errorf("%q is negative", s)
+		}
+		if prod := f * float64(mult); prod > float64(math.MaxUint64) {
+			return 0, fmt.Errorf("%q is too large a size", s)
+		}
+		n = uint64(f * float64(mult))
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("%q is not a usable size", s)
+	}
+	return n, nil
+}
+
+// FormatSize renders a byte count in the binary units ParseSize accepts.
+func FormatSize(n uint64) string {
+	v := float64(n)
+	switch {
+	case v >= 1<<40:
+		return trimZeros(strconv.FormatFloat(v/(1<<40), 'f', 2, 64)) + "T"
+	case v >= 1<<30:
+		return trimZeros(strconv.FormatFloat(v/(1<<30), 'f', 2, 64)) + "G"
+	case v >= 1<<20:
+		return trimZeros(strconv.FormatFloat(v/(1<<20), 'f', 2, 64)) + "M"
+	case v >= 1<<10:
+		return trimZeros(strconv.FormatFloat(v/(1<<10), 'f', 2, 64)) + "k"
+	default:
+		return strconv.FormatUint(n, 10)
+	}
+}
+
 func formatSI(v float64) string {
 	switch {
 	case v >= 1e9:

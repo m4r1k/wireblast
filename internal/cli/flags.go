@@ -24,11 +24,12 @@ type RunFunc func(ctx context.Context, cfg *config.Config) error
 
 // options holds the raw string forms of flags that need custom parsing.
 type options struct {
-	pps      string
-	bps      string
-	rxPorts  []string
-	etherHex string
-	forget   bool
+	pps        string
+	bps        string
+	rxPorts    []string
+	etherHex   string
+	pcapMemory string
+	forget     bool
 }
 
 // NewRootCommand builds the `wireblast` command. Running it with no flags at
@@ -124,6 +125,9 @@ in L1, so --bps 10G means 10G line rate.`,
 	f.StringVar((*string)(&cfg.PCAPTiming), "pcap-timing", string(cfg.PCAPTiming),
 		"pcap pacing: rate (use --pps/--bps) or original (preserve capture timing)")
 	f.BoolVar(&cfg.PCAPLoop, "pcap-loop", cfg.PCAPLoop, "loop the capture until the duration expires")
+	f.StringVar(&opt.pcapMemory, "pcap-memory", "",
+		"memory budget for loading the capture, in binary units (e.g. 512M, 4G; default 1G). "+
+			"The whole capture is held in RAM, so the budget has to fit")
 
 	f.BoolVar(&cfg.NoTUI, "no-tui", cfg.NoTUI,
 		"skip the wizard and dashboard; validate the flags and run, printing periodic statistics")
@@ -165,6 +169,13 @@ func applyOptions(cmd *cobra.Command, cfg *config.Config, opt *options) error {
 		if !f.Changed("pps") {
 			cfg.PPS = 0
 		}
+	}
+	if f.Changed("pcap-memory") {
+		v, err := config.ParseSize(opt.pcapMemory)
+		if err != nil {
+			return fmt.Errorf("--pcap-memory: %w", err)
+		}
+		cfg.PCAPMemory = v
 	}
 	if f.Changed("ethertype") {
 		v, err := parseEtherType(opt.etherHex)

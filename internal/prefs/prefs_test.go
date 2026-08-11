@@ -292,6 +292,7 @@ func TestEveryFieldRoundTrips(t *testing.T) {
 		Duration: 90 * time.Second, PPS: 123456, BPS: 7e9, Queues: 3,
 		RxMode: config.RxUDPPort, RxPorts: []uint16{53, 5353}, RxCIDR: "10.0.0.0/8",
 		PCAPFile: "/tmp/x.pcap", PCAPTiming: config.PcapOriginal, PCAPLoop: false,
+		PCAPMemory: 4 << 30,
 	}
 	if err := s.Save(&c); err != nil {
 		t.Fatal(err)
@@ -313,7 +314,7 @@ func TestEveryFieldRoundTrips(t *testing.T) {
 		got.PPS != want.PPS || got.BPS != want.BPS || got.Queues != want.Queues ||
 		got.RxMode != want.RxMode || got.RxCIDR != want.RxCIDR ||
 		got.PCAPFile != want.PCAPFile || got.PCAPTiming != want.PCAPTiming ||
-		got.PCAPLoop != want.PCAPLoop {
+		got.PCAPLoop != want.PCAPLoop || got.PCAPMemory != want.PCAPMemory {
 		t.Errorf("a field was lost in the round trip:\n got %+v\nwant %+v", got, want)
 	}
 	if len(got.RxPorts) != 2 || got.RxPorts[0] != 53 || got.RxPorts[1] != 5353 {

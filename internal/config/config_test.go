@@ -122,6 +122,12 @@ func TestValidate(t *testing.T) {
 		{"pcap bad timing", func(c *Config) {
 			c.Mode, c.PCAPFile, c.PCAPTiming = ModePCAP, "x.pcap", "asap"
 		}, "--pcap-timing"},
+		{"pcap memory too small", func(c *Config) {
+			c.Mode, c.PCAPFile, c.PCAPMemory = ModePCAP, "x.pcap", 4
+		}, "--pcap-memory"},
+		{"pcap memory ok", func(c *Config) {
+			c.Mode, c.PCAPFile, c.PCAPMemory = ModePCAP, "x.pcap", 4<<30
+		}, ""},
 		{"pcap ignores packet size", func(c *Config) {
 			c.Mode, c.PCAPFile, c.PacketSize = ModePCAP, "x.pcap", 0
 		}, ""},
