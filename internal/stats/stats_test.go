@@ -234,7 +234,7 @@ func TestKernelDiagnosticsKeepTypesAndRatesSeparate(t *testing.T) {
 	}
 }
 
-func TestPerQueueProblemsReportEveryCounterType(t *testing.T) {
+func TestPerQueueProblemsExcludeEmptyRingPolls(t *testing.T) {
 	k := Kernel{PerQueue: []KernelQueue{{
 		Queue: 7, RxDropped: 1, RxRingFull: 2, RxInvalidDescs: 3,
 		TxInvalidDescs: 4, RxFillRingEmpty: 5, TxRingEmpty: 6,
@@ -242,7 +242,6 @@ func TestPerQueueProblemsReportEveryCounterType(t *testing.T) {
 	got := problems(k, Kernel{})
 	for _, want := range []string{
 		"rx dropped", "rx ring full", "rx invalid descriptors", "tx invalid descriptors",
-		"rx fill ring empty", "tx ring empty",
 	} {
 		found := false
 		for _, line := range got {
@@ -255,8 +254,13 @@ func TestPerQueueProblemsReportEveryCounterType(t *testing.T) {
 			t.Errorf("problems = %v, missing %q", got, want)
 		}
 	}
-	if len(got) != 6 {
-		t.Errorf("problems has %d entries, want one for each counter type", len(got))
+	if len(got) != 4 {
+		t.Errorf("problems has %d entries, want only the four drop counters: %v", len(got), got)
+	}
+	for _, line := range got {
+		if strings.Contains(line, "ring empty") {
+			t.Errorf("empty-ring polling is informational, not a problem: %v", got)
+		}
 	}
 }
 

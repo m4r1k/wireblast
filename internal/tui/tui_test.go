@@ -1205,9 +1205,17 @@ func TestDashboardShowsTypedAFXDPDiagnostics(t *testing.T) {
 	}
 	m := model{}
 	compact := m.dashDiagnostics(s)
-	for _, want := range []string{"AF_XDP", "drops 100", "ring starvation 110", "w to show"} {
+	for _, want := range []string{
+		"AF_XDP diagnostics", "rx_dropped", "rx_ring_full",
+		"rx_invalid_descs", "tx_invalid_descs",
+	} {
 		if !strings.Contains(compact, want) {
 			t.Errorf("compact diagnostics missing %q:\n%s", want, compact)
+		}
+	}
+	for _, unwanted := range []string{"rx_fill_ring_empty_descs", "tx_ring_empty_descs", "ring starvation"} {
+		if strings.Contains(compact, unwanted) {
+			t.Errorf("compact diagnostics should hide %q:\n%s", unwanted, compact)
 		}
 	}
 	m.showProblems = true
@@ -1219,6 +1227,34 @@ func TestDashboardShowsTypedAFXDPDiagnostics(t *testing.T) {
 		if !strings.Contains(expanded, want) {
 			t.Errorf("expanded diagnostics missing %q:\n%s", want, expanded)
 		}
+	}
+	for _, want := range []string{
+		"polls that found the fill ring empty",
+		"polls that found the TX ring empty (normal when idle or rate limited)",
+	} {
+		if !strings.Contains(expanded, want) {
+			t.Errorf("expanded diagnostics missing friendly wording %q:\n%s", want, expanded)
+		}
+	}
+}
+
+func TestIdleReceiverHidesEmptyRingCountersByDefault(t *testing.T) {
+	s := &stats.Snapshot{
+		At:            time.Unix(10, 0),
+		IntervalSince: time.Unix(0, 0),
+		KernelInterval: stats.Kernel{
+			TxRingEmpty: 100,
+		},
+	}
+
+	m := model{}
+	if got := m.dashDiagnostics(s); got != "" {
+		t.Errorf("idle receiver should have no default AF_XDP warning, got:\n%s", got)
+	}
+
+	m.showProblems = true
+	if got := m.dashDiagnostics(s); !strings.Contains(got, "tx_ring_empty_descs") {
+		t.Errorf("expanded detail should preserve tx_ring_empty_descs:\n%s", got)
 	}
 }
 

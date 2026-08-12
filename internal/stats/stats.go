@@ -133,7 +133,7 @@ type Kernel struct {
 }
 
 // KernelQueue is one queue's slice of the kernel counters, used to point at a
-// queue that is dropping or stalled.
+// queue that is dropping packets and to preserve per-queue diagnostics.
 type KernelQueue struct {
 	Queue           int
 	RxPackets       uint64
@@ -171,8 +171,8 @@ func (k Kernel) Diagnostics(duration time.Duration) []KernelDiagnostic {
 		{Name: "rx_ring_full", Meaning: "RX drops because the RX ring was full", Count: k.RxRingFull, Drop: true},
 		{Name: "rx_invalid_descs", Meaning: "RX drops due to invalid descriptors", Count: k.RxInvalidDescs, Drop: true},
 		{Name: "tx_invalid_descs", Meaning: "TX drops due to invalid descriptors", Count: k.TxInvalidDescs, Drop: true},
-		{Name: "rx_fill_ring_empty_descs", Meaning: "failed reads from an empty fill ring", Count: k.RxFillRingEmpty},
-		{Name: "tx_ring_empty_descs", Meaning: "failed reads from an empty TX ring", Count: k.TxRingEmpty},
+		{Name: "rx_fill_ring_empty_descs", Meaning: "polls that found the fill ring empty", Count: k.RxFillRingEmpty},
+		{Name: "tx_ring_empty_descs", Meaning: "polls that found the TX ring empty (normal when idle or rate limited)", Count: k.TxRingEmpty},
 	}
 	for i := range values {
 		values[i].PerSecond = rate(values[i].Count)
@@ -322,7 +322,7 @@ type Snapshot struct {
 	Kernel         Kernel // lifetime counters for this run
 	KernelInterval Kernel // counters since the last on-screen reset
 
-	// Problems names queues that are dropping or stalled, ready to display.
+	// Problems names queues with actionable drop counters, ready to display.
 	Problems []string
 
 	// Transmits is false for a receive-only run, so the status line can leave
@@ -624,10 +624,9 @@ func rateOver(now, then Totals, dt float64) Rates {
 	}
 }
 
-// problems turns the per-queue kernel counters into short, displayable
-// descriptions of queues that are losing packets.
-// problems names queues that are dropping or stalling, counting only what has
-// happened since the last reset (base) so the `r` hotkey clears them.
+// problems names queues with actionable drop counters, counting only what has
+// happened since the last reset (base) so the `r` hotkey clears them. Empty-ring
+// polls are intentionally excluded because they can be normal when idle.
 func problems(k, base Kernel) []string {
 	baseQ := make(map[int]KernelQueue, len(base.PerQueue))
 	for _, q := range base.PerQueue {
@@ -647,12 +646,6 @@ func problems(k, base Kernel) []string {
 		}
 		if q.TxInvalidDescs > b.TxInvalidDescs {
 			out = append(out, formatQueueProblem(q.Queue, "tx invalid descriptors", q.TxInvalidDescs-b.TxInvalidDescs))
-		}
-		if q.RxFillRingEmpty > b.RxFillRingEmpty {
-			out = append(out, formatQueueProblem(q.Queue, "rx fill ring empty", q.RxFillRingEmpty-b.RxFillRingEmpty))
-		}
-		if q.TxRingEmpty > b.TxRingEmpty {
-			out = append(out, formatQueueProblem(q.Queue, "tx ring empty", q.TxRingEmpty-b.TxRingEmpty))
 		}
 	}
 	return out

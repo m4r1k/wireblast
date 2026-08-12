@@ -118,16 +118,15 @@ The [namespace lab guide](https://wireblast.mintlify.site/guides/namespace-lab) 
 
 ### AF_XDP diagnostics
 
-The dashboard keeps packet drops and ring-starvation events separate. Press
-`w` during a run to expand the compact AF_XDP line into all six Linux
-`XDP_STATISTICS` counters, with exact UAPI names, counts, rates, meanings and
-per-queue details. The final summary prints the same counter taxonomy for
-unattended `--no-tui` runs.
+The default dashboard and final summary show only nonzero packet-drop counters.
+Press `w` during a run to expand the AF_XDP detail into all six Linux
+`XDP_STATISTICS` counters, with exact UAPI names, counts, rates and meanings.
 
 `rx_dropped`, `rx_ring_full`, `rx_invalid_descs` and `tx_invalid_descs` report
-drops. `rx_fill_ring_empty_descs` and `tx_ring_empty_descs` report failed ring
-retrievals: useful signs of starvation, but not packet-loss counts. See the
-[Linux AF_XDP documentation](https://docs.kernel.org/networking/af_xdp.html)
+drops. `rx_fill_ring_empty_descs` and `tx_ring_empty_descs` count polls that
+found an empty ring. They remain available as neutral expanded diagnostics and
+in machine-readable output, but do not appear as errors in the default views.
+See the [Linux AF_XDP documentation](https://docs.kernel.org/networking/af_xdp.html)
 and [`struct xdp_statistics`](https://github.com/torvalds/linux/blob/master/include/uapi/linux/if_xdp.h).
 
 ## Examples

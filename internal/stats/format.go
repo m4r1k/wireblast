@@ -190,12 +190,18 @@ func (s *Snapshot) Summary() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// afxdpSummary keeps the six XDP_STATISTICS counter types separate. In
-// particular, empty-ring events are pressure signals, not packet-drop counts.
+// afxdpSummary reports only nonzero drop counters. Empty-ring polling remains
+// available in expanded TUI detail and machine-readable output, but is not an
+// actionable condition in a final human-readable report.
 func (s *Snapshot) afxdpSummary() string {
 	var b strings.Builder
-	b.WriteString("  AF_XDP diagnostics:\n")
 	for _, d := range s.Kernel.Diagnostics(s.Elapsed) {
+		if !d.Drop || d.Count == 0 {
+			continue
+		}
+		if b.Len() == 0 {
+			b.WriteString("  AF_XDP diagnostics:\n")
+		}
 		fmt.Fprintf(&b, "      %-25s %s (%s)  %s\n",
 			d.Name, Count(d.Count), PerSecond(d.PerSecond), d.Meaning)
 	}

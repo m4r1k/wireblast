@@ -389,27 +389,25 @@ func (m model) dashFooter(s *stats.Snapshot) string {
 }
 
 // dashDiagnostics shows the kernel's AF_XDP socket counters. The collapsed
-// line separates drops from empty-ring events; pressing w reveals exact UAPI
-// names, meanings, counts and average rates since the last counter reset.
+// view reports only nonzero drop counters; pressing w reveals all six UAPI
+// counters, including informational empty-ring polling.
 func (m model) dashDiagnostics(s *stats.Snapshot) string {
 	duration := s.At.Sub(s.IntervalSince)
 	diagnostics := s.KernelInterval.Diagnostics(duration)
-	var drops, starvation uint64
-	for _, d := range diagnostics {
-		if d.Drop {
-			drops += d.Count
-		} else {
-			starvation += d.Count
-		}
-	}
 	if !m.showProblems {
-		line := fmt.Sprintf("  AF_XDP  drops %s · ring starvation %s",
-			stats.Count(drops), stats.Count(starvation))
-		style := styleFaint
-		if drops+starvation > 0 {
-			style = styleWarn
+		var b strings.Builder
+		for _, d := range diagnostics {
+			if !d.Drop || d.Count == 0 {
+				continue
+			}
+			if b.Len() == 0 {
+				b.WriteString(styleLabel.Render("  AF_XDP diagnostics") + "\n")
+			}
+			line := fmt.Sprintf("    %-25s %8s  %10s  %s",
+				d.Name, stats.Count(d.Count), stats.PerSecond(d.PerSecond), d.Meaning)
+			b.WriteString(styleWarn.Render(line) + "\n")
 		}
-		return style.Render(line) + styleFaint.Render("  (w to show)") + "\n"
+		return b.String()
 	}
 
 	var b strings.Builder
@@ -418,7 +416,7 @@ func (m model) dashDiagnostics(s *stats.Snapshot) string {
 		line := fmt.Sprintf("    %-25s %8s  %10s  %s",
 			d.Name, stats.Count(d.Count), stats.PerSecond(d.PerSecond), d.Meaning)
 		style := styleFaint
-		if d.Count > 0 {
+		if d.Drop && d.Count > 0 {
 			style = styleWarn
 		}
 		b.WriteString(style.Render(line) + "\n")
