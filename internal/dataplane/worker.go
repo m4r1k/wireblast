@@ -3,6 +3,7 @@ package dataplane
 import (
 	"context"
 	"errors"
+	"runtime"
 	"time"
 
 	afxdp "github.com/atoonk/go-afxdp"
@@ -29,6 +30,16 @@ var errNothingBuilt = errors.New("generator produced no packets")
 // shorter gaps are accumulated and paid off together.
 const pacingFloor = 250 * time.Microsecond
 
+// txStallAfter is how long a queue may go without queueing a packet before a
+// full transmit ring is read as a sustained stall rather than the kernel simply
+// being busy draining it.
+const txStallAfter = time.Millisecond
+
+// txStallBackoff bounds CPU use once a queue is genuinely stalled, a downed
+// link being the usual reason. Transient ring pressure retries instead, so the
+// hot path never pays timer overshoot.
+const txStallBackoff = 250 * time.Microsecond
+
 // txLoop is one queue's transmit loop. It owns this socket's transmit side
 // exclusively, which is what makes the lock-free go-afxdp contract hold.
 //
@@ -40,6 +51,7 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 	el := newErrLog(r.logf)
 	sleeper := newSleeper()
 	defer sleeper.stop()
+	stall := newTxStall()
 
 	pacer, paced := gen.(generator.Pacer)
 	finite, isFinite := gen.(generator.Finite)
@@ -98,6 +110,9 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 			want = 1
 			owed += pacer.Delay()
 			if owed >= pacingFloor {
+				// Waiting out a capture's own gap is the loop pausing on
+				// purpose, not a queue that cannot transmit.
+				stall.clear()
 				if !sleeper.sleep(ctx, owed) {
 					return
 				}
@@ -107,6 +122,10 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 
 		grant, wait := r.limiter.Acquire(want, avgWire)
 		if grant.Packets == 0 {
+			// Same as the pacing wait above: no rate credit yet is a wait this
+			// loop chose. Carrying a stall marker across it would send the next
+			// full ring straight to the timer instead of retrying.
+			stall.clear()
 			if !sleeper.sleep(ctx, wait) {
 				return
 			}
@@ -125,6 +144,14 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 			return // the socket was closed under us during shutdown
 		case err != nil:
 			// Nothing was queued, so none of the accumulated counts happened.
+			//
+			// The stall clock is deliberately left alone here. Every form of
+			// ring backpressure comes back as a zero count and no error, so an
+			// error means malformed input rather than a busy queue, and says
+			// nothing about whether the ring drained. Clearing it on a
+			// condition that can repeat forever is the one way this loop could
+			// spin unbounded; keeping it costs at most one extra short sleep in
+			// a run that is already failing.
 			ctr.TxErrors.Add(1)
 			r.limiter.Settle(grant, 0, 0)
 			if buildErrs == 0 {
@@ -144,12 +171,26 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 		r.limiter.Settle(grant, sent, bytes+uint64(sent)*wireOverhead)
 
 		if sent == 0 {
-			// The ring was momentarily full. SendFunc already kicked the
-			// kernel; yield briefly rather than spinning on it.
-			if !sleeper.sleep(ctx, 50*time.Microsecond) {
+			// A full ring is normally transient, and retrying is what clears
+			// it: SendFunc reclaims completed frames and kicks the driver on
+			// the way in, so sleeping here suspends the only thing that unsticks
+			// the queue. Timer overshoot on Linux runs to hundreds of
+			// microseconds, far longer than a ring this deep stays busy, so a
+			// sleep drains the NIC dry. Yield and come straight back.
+			//
+			// A queue that makes no progress at all is a different thing: a
+			// downed link would otherwise spin a core forever. Once one has been
+			// stuck for txStallAfter, fall back to a cancellable timer.
+			if !stall.backoff() {
+				runtime.Gosched()
+				continue
+			}
+			if !sleeper.sleep(ctx, txStallBackoff) {
 				return
 			}
+			continue
 		}
+		stall.clear()
 	}
 }
 
@@ -278,6 +319,33 @@ func (r *Runner) rxLoop(ctx context.Context, queue int, xsk *afxdp.Socket) {
 		xsk.RecyclePackets(pkts)
 	}
 }
+
+// txStall tracks how long a queue has gone without queueing a packet, which is
+// what separates a ring the kernel is busy draining from one nothing is
+// draining at all.
+//
+// It reads the clock only while a stall is in progress. A loop transmitting
+// normally never calls backoff, and clear never looks at the time, so the
+// success path stays off the clock entirely.
+type txStall struct {
+	since time.Time
+	now   func() time.Time
+}
+
+func newTxStall() *txStall { return &txStall{now: time.Now} }
+
+// backoff records a batch that queued nothing and reports whether the queue has
+// been stuck long enough to be worth sleeping on. False means retry now.
+func (s *txStall) backoff() bool {
+	if s.since.IsZero() {
+		s.since = s.now()
+		return false
+	}
+	return !s.now().Before(s.since.Add(txStallAfter))
+}
+
+// clear forgets a stall in progress, so the next one starts its own budget.
+func (s *txStall) clear() { s.since = time.Time{} }
 
 // sleeper is a reusable timer, so a worker that waits thousands of times a
 // second for rate credit still allocates nothing.
