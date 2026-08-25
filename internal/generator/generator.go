@@ -97,6 +97,10 @@ type flowGen struct {
 	cursor queueCursor
 	class  stats.Class
 
+	// table, when set, holds this queue's whole flow cycle already built, so a
+	// packet is one copy. nil falls back to mutating tmpl per packet.
+	table *frameTable
+
 	// sizes is the expanded frame-size cycle, nil for fixed-size traffic.
 	sizes   []int
 	sizeIdx int
@@ -125,6 +129,7 @@ func newFlowGen(s Spec, proto uint8, mix []MixEntry) (*flowGen, error) {
 			VaryDstPort: cfg.VaryDstPort,
 			Flows:       max(cfg.Flows, 1),
 			Scatter:     cfg.FlowOrder == config.FlowRandom,
+			stride:      flowStride(cfg),
 		},
 		cursor: newQueueCursor(s.Queue, s.Queues, max(cfg.Flows, 1)),
 	}
@@ -210,10 +215,93 @@ func newFlowGen(s Spec, proto uint8, mix []MixEntry) (*flowGen, error) {
 	} else {
 		g.avgWire = frameLen + wireOverhead
 	}
+	g.buildTable(s.Queues, frameLen)
 	return g, nil
 }
 
+// maxFrameTableBytes caps one queue's prebuilt table. Past it the flow set is
+// large enough that the table would cost more memory than the per-packet work
+// it saves is worth, and the mutating path takes over. At 68-byte frames this
+// is around half a million flows per queue.
+const maxFrameTableBytes = 32 << 20
+
+// buildTable prebuilds every frame this queue will ever send, in the order it
+// will send them.
+//
+// It is worth doing because nothing inside a flow changes between packets: the
+// IP identification field is fixed, a SYN carries no varying sequence number,
+// and the payload is a constant fill. So the whole of Next — the flow lookup
+// with its divisions, the four header writes, and the checksum patches, which
+// for TCP are three serialised read-modify-writes of the same two bytes —
+// produces a frame that repeats with the flow cycle. Building each one once
+// turns the hot path into a single copy.
+//
+// The frames are built by driving the same template setters the mutating path
+// uses, so every combination they already handle — IPv4 and IPv6, VLAN tags,
+// UDP and TCP, --vary-dst-port — is right here without restating any of it.
+// Scattered flow order is baked into the table's order, so the stride search
+// never runs per packet either.
+//
+// A mixed-size run is left alone: its size cycle turns independently of the
+// flow cycle, so the table would have to hold their combined period.
+func (g *flowGen) buildTable(queues, frameLen int) {
+	if g.sizes != nil || frameLen <= 0 {
+		return
+	}
+	// The cursor steps by the queue count and wraps at the flow count, so this
+	// queue only ever visits flows/gcd(flows, queues) of them before repeating.
+	flows := g.spec.Flows
+	if queues < 1 {
+		queues = 1
+	}
+	n := flows / gcd(flows, queues)
+	if n < 1 || n > maxFrameTableBytes/frameLen {
+		return
+	}
+
+	buf := make([]byte, n*frameLen)
+	cur := g.cursor // a copy: the real cursor is not consumed here
+	for i := range n {
+		f := g.spec.At(cur.next())
+		g.tmpl.SetSrcIP(f.SrcIP)
+		g.tmpl.SetDstIP(f.DstIP)
+		g.tmpl.SetSrcPort(f.SrcPort)
+		g.tmpl.SetDstPort(f.DstPort)
+		copy(buf[i*frameLen:(i+1)*frameLen], g.tmpl.Bytes())
+	}
+	g.table = &frameTable{buf: buf, stride: frameLen, n: n}
+}
+
+// flowStride precomputes the scatter multiplier, which depends only on the
+// flow count. Zero when flows are walked in order and it is never needed.
+func flowStride(cfg *config.Config) int {
+	if cfg.FlowOrder != config.FlowRandom {
+		return 0
+	}
+	return scatterStride(max(cfg.Flows, 1))
+}
+
+// frameTable is one queue's flow cycle, prebuilt and laid out end to end.
+type frameTable struct {
+	buf    []byte // n frames of stride bytes
+	stride int
+	n      int
+	idx    int
+}
+
+// next copies the frame at the cursor into dst and advances.
+func (t *frameTable) next(dst []byte) int {
+	off := t.idx * t.stride
+	if t.idx++; t.idx == t.n {
+		t.idx = 0
+	}
+	return copy(dst, t.buf[off:off+t.stride])
+}
+
 func (g *flowGen) Next(frame []byte) (int, stats.Class) {
+	if g.table != nil {
+		return g.table.next(frame), g.class
+	}
 	f := g.spec.At(g.cursor.next())
 	g.tmpl.SetSrcIP(f.SrcIP)
 	g.tmpl.SetDstIP(f.DstIP)

@@ -43,6 +43,10 @@ type FlowSpec struct {
 	// still completely deterministic — it just stops consecutive packets
 	// carrying consecutive ports, which some receivers hash badly.
 	Scatter bool
+	// stride is the scatter multiplier, which depends only on Flows. Zero
+	// means "not worked out yet", so a FlowSpec built by hand still behaves;
+	// the constructor fills it in so the search below does not run per packet.
+	stride int
 }
 
 // At returns the tuple for flow n. n is taken modulo Flows, so callers may
@@ -54,7 +58,7 @@ func (s FlowSpec) At(n int) Flow {
 	}
 	n = ((n % flows) + flows) % flows // tolerate a negative n
 	if s.Scatter {
-		n = scatter(n, flows)
+		n = scatter(n, flows, s.stride)
 	}
 
 	f := Flow{
@@ -200,11 +204,15 @@ func (c *queueCursor) next() int {
 // every flow is still visited exactly once per cycle — the order is simply
 // spread out instead of consecutive. It needs no table and no state, which
 // matters because this runs per packet.
-func scatter(n, flows int) int {
+// stride is the precomputed multiplier, or zero to work it out here.
+func scatter(n, flows, stride int) int {
 	if flows < 3 {
 		return n
 	}
-	return (n * scatterStride(flows)) % flows
+	if stride == 0 {
+		stride = scatterStride(flows)
+	}
+	return (n * stride) % flows
 }
 
 // scatterStride picks the multiplier. Starting near the golden ratio of the

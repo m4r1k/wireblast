@@ -40,6 +40,23 @@ const txStallAfter = time.Millisecond
 // hot path never pays timer overshoot.
 const txStallBackoff = 250 * time.Microsecond
 
+// txAccum totals one batch as it is built. The frame check sequence the NIC
+// will append is included, so byte totals and average frame sizes come out in
+// the same units as --packet-size.
+type txAccum struct {
+	bytes     uint64
+	clsPkts   [3]int
+	clsBytes  [3]uint64
+	buildErrs int
+}
+
+// add folds one built packet in.
+func (a *txAccum) add(n int, class stats.Class) {
+	a.bytes += uint64(n + fcsLen)
+	a.clsPkts[class]++
+	a.clsBytes[class] += uint64(n + fcsLen)
+}
+
 // txLoop is one queue's transmit loop. It owns this socket's transmit side
 // exclusively, which is what makes the lock-free go-afxdp contract hold.
 //
@@ -57,30 +74,29 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 	finite, isFinite := gen.(generator.Finite)
 	avgWire := gen.AvgWireBytes()
 
-	// Per-batch accumulators, declared once so the closures below capture
-	// stack slots rather than allocating each time round.
-	var (
-		bytes     uint64
-		clsPkts   [3]int
-		clsBytes  [3]uint64
-		buildErrs int
-		// owed is unslept capture time accumulated in original-timing mode.
-		owed time.Duration
-	)
-
-	// count folds one built packet into the accumulators. The FCS the NIC will
-	// append is included, so byte totals and average frame sizes are in the
-	// same units as --packet-size.
-	count := func(n int, class stats.Class) {
-		bytes += uint64(n + fcsLen)
-		clsPkts[class]++
-		clsBytes[class] += uint64(n + fcsLen)
+	// Place this goroutine beside its queue's interrupt, and remember whether
+	// it worked: owning a core decides how this loop may wait on a full ring,
+	// in the branch below. Pinning here rather than letting the first send do
+	// it means the answer is known before the loop needs it.
+	cpu, err := xsk.Pin()
+	if err != nil {
+		el.printf("queue %d: %v", queue, err)
 	}
+	pinned := cpu >= 0
+
+	// One accumulator per queue, reset per batch. It is a single heap object
+	// the send callback writes through, rather than several separately
+	// captured variables: the callback is handed to go-afxdp and so escapes,
+	// which would escape each variable on its own.
+	acc := &txAccum{}
+
+	// owed is unslept capture time accumulated in original-timing mode.
+	var owed time.Duration
 
 	// send builds and queues up to want packets, returning how many the kernel
 	// took. Which implementation runs is decided once, here, rather than per
 	// batch.
-	batchCap, send := r.sender(xsk, gen, count, &buildErrs)
+	batchCap, send := r.sender(xsk, gen, acc)
 
 	for {
 		if ctx.Err() != nil {
@@ -132,10 +148,7 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 			continue
 		}
 
-		bytes = 0
-		clsPkts = [3]int{}
-		clsBytes = [3]uint64{}
-		buildErrs = 0
+		*acc = txAccum{}
 
 		sent, err := send(grant.Packets)
 
@@ -154,21 +167,21 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 			// a run that is already failing.
 			ctr.TxErrors.Add(1)
 			r.limiter.Settle(grant, 0, 0)
-			if buildErrs == 0 {
+			if acc.buildErrs == 0 {
 				el.printf("queue %d: transmit: %v", queue, err)
 			}
-			if buildErrs > 0 {
+			if acc.buildErrs > 0 {
 				return // the generator is exhausted mid-batch; this queue is done
 			}
 			continue
 		}
 
-		for c := range clsPkts {
-			if clsPkts[c] > 0 {
-				ctr.AddTx(clsPkts[c], clsBytes[c], stats.Class(c))
+		for c := range acc.clsPkts {
+			if acc.clsPkts[c] > 0 {
+				ctr.AddTx(acc.clsPkts[c], acc.clsBytes[c], stats.Class(c))
 			}
 		}
-		r.limiter.Settle(grant, sent, bytes+uint64(sent)*wireOverhead)
+		r.limiter.Settle(grant, sent, acc.bytes+uint64(sent)*wireOverhead)
 
 		if sent == 0 {
 			// A full ring is normally transient, and retrying is what clears
@@ -176,13 +189,38 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 			// the way in, so sleeping here suspends the only thing that unsticks
 			// the queue. Timer overshoot on Linux runs to hundreds of
 			// microseconds, far longer than a ring this deep stays busy, so a
-			// sleep drains the NIC dry. Yield and come straight back.
+			// sleep drains the NIC dry. Come straight back instead.
 			//
-			// A queue that makes no progress at all is a different thing: a
-			// downed link would otherwise spin a core forever. Once one has been
-			// stuck for txStallAfter, fall back to a cancellable timer.
+			// How to wait depends on whether this worker owns its core.
+			//
+			// Pinned, go straight back round. runtime.Gosched() on a goroutine
+			// locked to its thread is not the cheap run-queue shuffle it is for
+			// a floating one: the scheduler puts the goroutine on the global
+			// run queue under a process-wide lock, wakes a spinning thread to
+			// hunt for work, hands this thread's processor away, parks the
+			// thread, and wakes it again once another thread picks the
+			// goroutine back up. That is a cross-core rendezvous per yield, and
+			// at line rate a full ring is the normal condition rather than a
+			// rare one, so it lands on other cores as scheduler overhead: 16
+			// queues cost 23 cores where they should cost 16. Nothing else
+			// wants this processor, so nothing is owed a turn.
+			//
+			// Unpinned, yield as before. Then the worker is sharing processors
+			// with every other goroutine in the process, and there may be more
+			// workers than there are processors to run them — a container CPU
+			// quota, generic-mode XDP, an unrecognised driver, WithoutAffinity,
+			// or simply no room left to place this queue. Spinning without
+			// yielding there starves the stats, signal and duration goroutines
+			// until the runtime preempts by signal some milliseconds later, and
+			// with a single processor it does not make progress at all.
+			//
+			// A queue that makes no progress at all is a different thing again:
+			// a downed link would otherwise spin a core forever. Once one has
+			// been stuck for txStallAfter, fall back to a cancellable timer.
 			if !stall.backoff() {
-				runtime.Gosched()
+				if !pinned {
+					runtime.Gosched()
+				}
 				continue
 			}
 			if !sleeper.sleep(ctx, txStallBackoff) {
@@ -195,8 +233,8 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 }
 
 // sender picks how this run puts packets on the wire and returns the batch
-// size that goes with it. count is called for every packet the kernel accepts;
-// buildErrs is incremented when the generator has nothing left to give.
+// size that goes with it. Every packet the kernel accepts is folded into acc;
+// acc.buildErrs is incremented when the generator has nothing left to give.
 //
 // The two differ in where the packet is written. Normally the generator
 // serialises straight into the UMEM frame and nothing is copied. That is not
@@ -208,23 +246,25 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 func (r *Runner) sender(
 	xsk *afxdp.Socket,
 	gen generator.Generator,
-	count func(int, stats.Class),
-	buildErrs *int,
+	acc *txAccum,
 ) (int, func(want int) (int, error)) {
 	if !r.multiBuffer {
+		// Built once rather than per batch: it captures only gen and acc, both
+		// fixed for the life of the queue.
+		build := func(_ int, frame []byte) int {
+			n, class := gen.Next(frame)
+			if n <= 0 {
+				// A generator with nothing left. Returning 0 would put an
+				// empty frame on the wire, so report it as a build failure:
+				// SendFunc abandons the whole batch unqueued.
+				acc.buildErrs++
+				return -1
+			}
+			acc.add(n, class)
+			return n
+		}
 		return txBatch, func(want int) (int, error) {
-			return xsk.SendFunc(want, func(_ int, frame []byte) int {
-				n, class := gen.Next(frame)
-				if n <= 0 {
-					// A generator with nothing left. Returning 0 would put an
-					// empty frame on the wire, so report it as a build failure:
-					// SendFunc abandons the whole batch unqueued.
-					*buildErrs++
-					return -1
-				}
-				count(n, class)
-				return n
-			})
+			return xsk.SendFunc(want, build)
 		}
 	}
 
@@ -244,7 +284,7 @@ func (r *Runner) sender(
 			buf := arena[i*r.maxFrame : (i+1)*r.maxFrame]
 			n, class := gen.Next(buf)
 			if n <= 0 {
-				*buildErrs++
+				acc.buildErrs++
 				break
 			}
 			payloads[built] = buf[:n]
@@ -265,7 +305,7 @@ func (r *Runner) sender(
 		// the ring is short of room, so count what went rather than what was
 		// built.
 		for i := range sent {
-			count(pktLen[i], pktClass[i])
+			acc.add(pktLen[i], pktClass[i])
 		}
 		return sent, nil
 	}

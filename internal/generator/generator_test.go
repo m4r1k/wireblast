@@ -1,7 +1,9 @@
 package generator
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net/netip"
 	"strings"
 	"testing"
@@ -529,6 +531,141 @@ func BenchmarkIMIXNext(b *testing.B) {
 	}
 	frame := make([]byte, 2048)
 	b.ReportAllocs()
+	for b.Loop() {
+		g.Next(frame)
+	}
+}
+
+// TestFrameTableMatchesMutate is the safety net for the prebuilt frame table:
+// for every combination the table is built for, it must emit exactly the bytes
+// the mutating path would have emitted, in the same order, across more than one
+// full cycle. The table is disabled on a second generator built identically,
+// and the two are compared frame by frame.
+func TestFrameTableMatchesMutate(t *testing.T) {
+	v4 := netip.MustParseAddr("192.168.0.99")
+	v6 := netip.MustParseAddr("2001:db8::99")
+
+	for _, mode := range []config.Mode{config.ModeUDP, config.ModeTCPSYN} {
+		for _, dst := range []string{"10.0.0.2", "10.0.0.0/16", "2001:db8:1::2", "2001:db8:1::/112"} {
+			for _, order := range []config.FlowOrder{config.FlowSequential, config.FlowRandom} {
+				for _, vlan := range []int{0, 2053} {
+					for _, varyDst := range []bool{false, true} {
+						for _, flows := range []int{1, 7, 256, 1000} {
+							for _, queues := range []int{1, 8, 16} {
+								for _, queue := range []int{0, queues - 1} {
+									name := fmt.Sprintf("%s/%s/%s/vlan%d/vary%v/flows%d/q%dof%d",
+										mode, dst, order, vlan, varyDst, flows, queue, queues)
+									t.Run(name, func(t *testing.T) {
+										cfg := config.Default()
+										cfg.Mode = mode
+										cfg.Flows = flows
+										cfg.DstIP = dst
+										cfg.VLAN = vlan
+										cfg.FlowOrder = order
+										cfg.VaryDstPort = varyDst
+
+										parsed, err := config.ParseDst(cfg.DstIP)
+										if err != nil {
+											t.Skipf("dst %s: %v", dst, err)
+										}
+										src := v4
+										if !parsed.Addr().Is4() {
+											src = v6
+										}
+										// A tagged frame has a higher floor than
+										// an untagged one; keep clear of both.
+										cfg.PacketSize = 128
+
+										spec := Spec{
+											Cfg: &cfg, SrcMAC: testSrcMAC, DstMAC: testDstMAC,
+											SrcIP: src, Dst: parsed, Queue: queue, Queues: queues,
+										}
+										withTable, err := New(spec)
+										if err != nil {
+											t.Fatalf("build: %v", err)
+										}
+										noTable, err := New(spec)
+										if err != nil {
+											t.Fatalf("build: %v", err)
+										}
+										fg, ok := withTable.(*flowGen)
+										if !ok {
+											t.Fatalf("expected *flowGen, got %T", withTable)
+										}
+										if fg.table == nil {
+											t.Fatalf("no table built; this case would not be testing anything")
+										}
+										ref, ok := noTable.(*flowGen)
+										if !ok {
+											t.Fatalf("expected *flowGen, got %T", noTable)
+										}
+										ref.table = nil // force the mutating path
+
+										// Two full cycles plus a bit, so the
+										// wrap is covered as well as the walk.
+										iters := 2*fg.table.n + 3
+										a := make([]byte, 2048)
+										b := make([]byte, 2048)
+										for i := range iters {
+											na, ca := withTable.Next(a)
+											nb, cb := noTable.Next(b)
+											if na != nb || ca != cb {
+												t.Fatalf("packet %d: table returned (%d,%v), mutate returned (%d,%v)",
+													i, na, ca, nb, cb)
+											}
+											if !bytes.Equal(a[:na], b[:nb]) {
+												t.Fatalf("packet %d differs:\n table  %x\n mutate %x", i, a[:na], b[:nb])
+											}
+										}
+									})
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// BenchmarkUDPNextFlows1 is the single-flow case, which is the default and by
+// far the most common: the whole table is one frame.
+func BenchmarkUDPNextFlows1(b *testing.B) {
+	benchNext(b, config.ModeUDP, 1, "10.0.0.2", config.FlowSequential)
+}
+
+// BenchmarkTCPNextFlows1 shows the SYN checksum work leaving the hot path.
+func BenchmarkTCPNextFlows1(b *testing.B) {
+	benchNext(b, config.ModeTCPSYN, 1, "10.0.0.2", config.FlowSequential)
+}
+
+// BenchmarkUDPNextRandom walks the flow space scrambled, which used to search
+// for a coprime stride on every packet.
+func BenchmarkUDPNextRandom(b *testing.B) {
+	benchNext(b, config.ModeUDP, 1000, "10.0.0.0/16", config.FlowRandom)
+}
+
+func benchNext(b *testing.B, mode config.Mode, flows int, dstIP string, order config.FlowOrder) {
+	b.Helper()
+	cfg := config.Default()
+	cfg.Mode = mode
+	cfg.Flows = flows
+	cfg.DstIP = dstIP
+	cfg.FlowOrder = order
+	dst, err := config.ParseDst(cfg.DstIP)
+	if err != nil {
+		b.Fatal(err)
+	}
+	g, err := New(Spec{
+		Cfg: &cfg, SrcMAC: testSrcMAC, DstMAC: testDstMAC,
+		SrcIP: netip.MustParseAddr("192.168.0.99"), Dst: dst, Queues: 1,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	frame := make([]byte, 2048)
+	b.ReportAllocs()
+	b.SetBytes(64)
 	for b.Loop() {
 		g.Next(frame)
 	}
