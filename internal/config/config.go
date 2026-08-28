@@ -161,6 +161,19 @@ type Config struct {
 	BPS      uint64        // on-the-wire bits/sec, 0 means unlimited
 	Queues   int           // 0 means all available queues
 
+	// QueuesPerWorker is how many transmit queues one worker drives,
+	// round-robin. Zero means let the backend decide: one for AF_XDP, whose
+	// per-queue work happens in a soft interrupt on that queue's own core, and
+	// several for mlx5, whose send queues have no interrupt and cap well below
+	// a core.
+	QueuesPerWorker int
+
+	// IO names the packet-I/O backend: "auto" (the default), "afxdp", or
+	// "mlx5" for Direct Verbs on ConnectX cards, which needs a binary built
+	// with -tags mlx5. Auto picks mlx5 for a transmit-only run on a ConnectX
+	// card and AF_XDP everywhere else; the run prints which it chose.
+	IO string
+
 	// Receive behaviour.
 	RxMode  RxMode
 	RxPorts []uint16
@@ -189,19 +202,21 @@ type Config struct {
 // wizard input is applied.
 func Default() Config {
 	return Config{
-		Mode:        ModeUDP,
-		SrcPort:     1024,
-		DstPort:     9000,
-		Flows:       1,
-		FlowOrder:   FlowSequential,
-		PacketSize:  64,
-		EtherType:   0x88b5, // IEEE 802 local experimental EtherType 1
-		PayloadByte: 0x5a,
-		Duration:    30 * time.Second,
-		PPS:         DefaultPPS,
-		RxMode:      RxNone,
-		PCAPTiming:  PcapRate,
-		PCAPLoop:    true,
+		Mode:            ModeUDP,
+		SrcPort:         1024,
+		DstPort:         9000,
+		Flows:           1,
+		FlowOrder:       FlowSequential,
+		PacketSize:      64,
+		EtherType:       0x88b5, // IEEE 802 local experimental EtherType 1
+		PayloadByte:     0x5a,
+		Duration:        30 * time.Second,
+		PPS:             DefaultPPS,
+		RxMode:          RxNone,
+		PCAPTiming:      PcapRate,
+		PCAPLoop:        true,
+		IO:              "auto",
+		QueuesPerWorker: 0,
 	}
 }
 
@@ -348,6 +363,22 @@ func (c *Config) Validate() error {
 
 	if c.Duration < 0 {
 		bad("--duration must not be negative (0 means run until stopped)")
+	}
+	if c.QueuesPerWorker < 0 {
+		return fmt.Errorf("--queues-per-worker %d", c.QueuesPerWorker)
+	}
+	if c.QueuesPerWorker > 1 {
+		if c.IO == "afxdp" {
+			return fmt.Errorf("--queues-per-worker %d needs the mlx5 backend: an AF_XDP queue's work runs in a soft interrupt on its own core, so sharing a worker between queues spreads that wider rather than saving it", c.QueuesPerWorker)
+		}
+		if c.PCAPFile != "" {
+			return errors.New("--queues-per-worker cannot replay a capture: pacing and one-pass replay want a queue to themselves")
+		}
+	}
+	switch c.IO {
+	case "", "auto", "afxdp", "mlx5":
+	default:
+		return fmt.Errorf("--io %q: use afxdp or mlx5", c.IO)
 	}
 	if c.Queues < 0 {
 		bad("--queues must not be negative (0 means all available queues)")

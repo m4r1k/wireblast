@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,15 +31,16 @@ func (netlinkSource) Links() ([]Link, error) {
 	for _, l := range links {
 		a := l.Attrs()
 		nl := Link{
-			Name:     a.Name,
-			Index:    a.Index,
-			MAC:      a.HardwareAddr,
-			MTU:      a.MTU,
-			Up:       a.Flags&net.FlagUp != 0,
-			Carrier:  a.OperState == netlink.OperUp || a.OperState == netlink.OperUnknown,
-			Loopback: a.Flags&net.FlagLoopback != 0,
-			Driver:   driverOf(a.Name),
-			RxQueues: countRxQueues(a.Name),
+			Name:      a.Name,
+			Index:     a.Index,
+			MAC:       a.HardwareAddr,
+			MTU:       a.MTU,
+			Up:        a.Flags&net.FlagUp != 0,
+			Carrier:   a.OperState == netlink.OperUp || a.OperState == netlink.OperUnknown,
+			Loopback:  a.Flags&net.FlagLoopback != 0,
+			Driver:    driverOf(a.Name),
+			RxQueues:  countRxQueues(a.Name),
+			SpeedMbps: linkSpeed(a.Name),
 		}
 		if v, ok := l.(*netlink.Vlan); ok {
 			nl.VLANID = v.VlanId
@@ -95,6 +97,21 @@ func countRxQueues(name string) int {
 		if strings.HasPrefix(e.Name(), "rx-") {
 			n++
 		}
+	}
+	return n
+}
+
+// linkSpeed reports the negotiated link speed in Mbit/s. It is 0 for a device
+// that does not report one: a virtual device, or a port with no carrier, where
+// sysfs holds -1 rather than a number.
+func linkSpeed(name string) int {
+	b, err := os.ReadFile(filepath.Join("/sys/class/net", name, "speed"))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || n < 0 {
+		return 0
 	}
 	return n
 }

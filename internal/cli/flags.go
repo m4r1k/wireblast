@@ -113,7 +113,12 @@ in L1, so --bps 10G means 10G line rate.`,
 	f.StringVar(&opt.bps, "bps", "",
 		"bit rate limit in L1 bits (frame plus preamble, SFD and interframe gap), "+
 			"aggregate across queues (e.g. 10G, 2.5Gbps, or 'unlimited')")
-	f.IntVar(&cfg.Queues, "queues", cfg.Queues, "number of NIC queues to transmit on (0 = all)")
+	f.IntVar(&cfg.Queues, "queues", cfg.Queues,
+		"number of NIC queues to transmit on (0 = every queue on AF_XDP, enough to fill the link on mlx5)")
+	f.IntVar(&cfg.QueuesPerWorker, "queues-per-worker", cfg.QueuesPerWorker,
+		"transmit queues one worker drives, round-robin (0 = per backend: 1 for AF_XDP, 4 for mlx5)")
+	f.StringVar(&cfg.IO, "io", cfg.IO,
+		"packet I/O backend: auto (default), afxdp, or mlx5 for ConnectX Direct Verbs (needs a -tags mlx5 build)")
 
 	f.StringVar((*string)(&cfg.RxMode), "rx-mode", string(cfg.RxMode),
 		"what to receive through AF_XDP: "+rxModeList())

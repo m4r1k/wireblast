@@ -182,11 +182,14 @@ func RaiseMemlock() (uint64, error) {
 
 // PreflightInput is everything the checks need to make their decisions.
 type PreflightInput struct {
-	Cfg    *config.Config
-	Res    *discovery.Resolved
-	Plan   FilterPlan
-	Env    Environment
-	Queues int
+	Cfg  *config.Config
+	Res  *discovery.Resolved
+	Plan FilterPlan
+	Env  Environment
+	// Backend is the resolved packet-I/O backend, "afxdp" or "mlx5". A few
+	// checks differ: mlx5 loads no XDP program and needs rdma device nodes.
+	Backend string
+	Queues  int
 	// MaxFrameLen is the largest frame the generator will emit, in bytes
 	// written (excluding the FCS).
 	MaxFrameLen int
@@ -212,11 +215,35 @@ func RunPreflight(in PreflightInput) *Preflight {
 
 	// Privileges.
 	if in.Env.Euid != 0 && !in.Env.HasNetRaw {
-		add(LevelFatal, "insufficient privileges",
-			"AF_XDP needs to create raw sockets and load an XDP program, which requires "+
-				"root or CAP_NET_RAW.",
+		detail := "AF_XDP needs to create raw sockets and load an XDP program, which requires " +
+			"root or CAP_NET_RAW."
+		if in.Backend == "mlx5" {
+			detail = "Direct Verbs needs to open the rdma device and register memory with it, " +
+				"which requires root or CAP_NET_RAW."
+		}
+		add(LevelFatal, "insufficient privileges", detail,
 			"Run with sudo, or grant the capability:\n"+
 				"  sudo setcap cap_net_raw,cap_bpf,cap_sys_resource+ep $(command -v wireblast)")
+	}
+
+	// Two ways --io mlx5 fails before it starts: this binary does not have the
+	// backend, or the kernel modules that expose the card to userspace are not
+	// loaded. They need different fixes, so tell them apart.
+	if in.Backend == "mlx5" {
+		switch {
+		case !mlx5Available:
+			add(LevelFatal, "this build has no mlx5 backend",
+				"Direct Verbs needs cgo and rdma-core, so it is behind a build tag and the "+
+					"ordinary binary — a single static file that runs anywhere — does not carry it.",
+				"Rebuild with it:\n  go build -tags mlx5 ./cmd/wireblast\n"+
+					"or run with --io afxdp, which needs neither.")
+		case !mlx5Usable():
+			add(LevelFatal, "no rdma device nodes",
+				"Direct Verbs opens the card through /dev/infiniband, which is empty or missing. "+
+					"The kernel modules that expose it are probably not loaded.",
+				"Load them:\n  sudo modprobe ib_uverbs mlx5_ib\n"+
+					"or run with --io afxdp, which needs none of this.")
+		}
 	}
 
 	// Locked memory. The UMEM is locked pages, and the default 8 MiB limit on

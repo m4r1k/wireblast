@@ -43,6 +43,11 @@ type Link struct {
 	// RxQueues is how many receive queues the device exposes. AF_XDP binds one
 	// socket per queue, so a device with none cannot be used.
 	RxQueues int
+
+	// SpeedMbps is the negotiated link speed, or 0 when the device does not
+	// report one (a veth, or a physical port with no carrier). Backends that
+	// size themselves against line rate need it; nothing else does.
+	SpeedMbps int
 }
 
 // IPv4 returns the link's IPv4 prefixes, in the order the kernel reports them.

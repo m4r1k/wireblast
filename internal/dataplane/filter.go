@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	afxdp "github.com/atoonk/go-afxdp"
+	"github.com/atoonk/packetio"
 
 	"github.com/atoonk/wireblast/internal/config"
 	"github.com/atoonk/wireblast/internal/discovery"
@@ -39,6 +40,17 @@ type FilterPlan struct {
 	// Dangerous marks the match-all filter, which needs an extra confirmation
 	// on top of any --yes.
 	Dangerous bool
+	// Steering is the same intent as Matches in packetio's backend-neutral
+	// vocabulary, for backends that steer in hardware rather than run an XDP
+	// program. It is what the mlx5 backend installs. Empty when the mode
+	// cannot be expressed as a set of inclusions, in which case
+	// HardwareUnsupported says why.
+	Steering packetio.SteeringFilter
+	// HardwareUnsupported is set when this receive mode is an XDP-only idea —
+	// an exclusion like keep-management — so a backend that steers in
+	// hardware must refuse it rather than quietly take more than asked.
+	HardwareUnsupported string
+
 	// KeepManagement asks the library to spare the traffic that keeps the box
 	// reachable (ARP, IPv6 ND, SSH and DNS to and from this host) even though
 	// the filter otherwise redirects everything. Set only by the
@@ -87,6 +99,18 @@ func (DefaultFilterBuilder) Plan(cfg *config.Config, res *discovery.Resolved) (F
 	return FilterPlan{}, fmt.Errorf("unknown receive mode %q", cfg.RxMode)
 }
 
+// steering builds the hardware-steering equivalent of a plan's matches. The
+// run's VLAN is part of every filter, because on a tagged interface that is
+// what distinguishes this run's traffic from the rest of the port's.
+func steering(cfg *config.Config, matches ...packetio.Match) packetio.SteeringFilter {
+	var f packetio.SteeringFilter
+	if cfg.VLAN > 0 {
+		f.Match = append(f.Match, packetio.MatchVLAN(uint16(cfg.VLAN)))
+	}
+	f.Match = append(f.Match, matches...)
+	return f
+}
+
 func planNone(cfg *config.Config) FilterPlan {
 	return FilterPlan{
 		Matches:   []afxdp.Match{afxdp.MatchNone()},
@@ -112,9 +136,13 @@ func planGeneratedFlow(cfg *config.Config, res *discovery.Resolved) (FilterPlan,
 	// Ports are genuinely not part of it, and the UI says so rather than
 	// implying a full 5-tuple match. The address matchers are family-aware, so
 	// this works for both IPv4 and IPv6.
+	hw := steering(cfg,
+		packetio.MatchSrcIP(res.Dst),
+		packetio.MatchDstIP(netip.PrefixFrom(res.SrcIP, res.SrcIP.BitLen())))
 	return FilterPlan{
 		receives: true,
 		Matches:  []afxdp.Match{afxdp.MatchFlow(dst, src)},
+		Steering: hw,
 		Summary:  fmt.Sprintf("src %s & dst %s", dst, src),
 		Redirects: fmt.Sprintf(
 			"%s packets coming from %s and addressed to %s. Those stop reaching the kernel "+
@@ -139,15 +167,23 @@ func planPorts(cfg *config.Config, proto string) (FilterPlan, error) {
 				"--rx-mode cidr, generated-flow, keep-management or all instead", proto)
 	}
 	var m afxdp.Match
+	ipProto := packetio.IPProtoTCP
 	if proto == "udp" {
 		m = afxdp.MatchUDPPort(cfg.RxPorts...)
+		ipProto = packetio.IPProtoUDP
 	} else {
 		m = afxdp.MatchTCPPort(cfg.RxPorts...)
+	}
+	// One hardware alternative per port: the backend installs one rule each.
+	var hwm []packetio.Match
+	for _, p := range cfg.RxPorts {
+		hwm = append(hwm, packetio.MatchDstPort(ipProto, p)...)
 	}
 	list := portList(cfg.RxPorts)
 	return FilterPlan{
 		receives: true,
 		Matches:  []afxdp.Match{m},
+		Steering: steering(cfg, hwm...),
 		Summary:  proto + "/" + list,
 		Redirects: fmt.Sprintf(
 			"IPv4 %s packets whose DESTINATION port is %s. Those stop reaching the kernel on %s.",
@@ -172,9 +208,14 @@ func planCIDR(cfg *config.Config) (FilterPlan, error) {
 	if p, err := netip.ParsePrefix(cfg.RxCIDR); err == nil && p.Bits() == 0 {
 		matchAll = true
 	}
+	var hw packetio.SteeringFilter
+	if p, err := netip.ParsePrefix(cfg.RxCIDR); err == nil {
+		hw = steering(cfg, packetio.MatchSrcIP(p))
+	}
 	return FilterPlan{
 		receives:  true,
 		Matches:   []afxdp.Match{afxdp.MatchSrcIP(cfg.RxCIDR)},
+		Steering:  hw,
 		Summary:   "src " + cfg.RxCIDR,
 		Dangerous: matchAll,
 		Redirects: fmt.Sprintf(
@@ -196,7 +237,10 @@ func planKeepManagement(cfg *config.Config) FilterPlan {
 		receives:       true,
 		Matches:        []afxdp.Match{afxdp.MatchAll()},
 		KeepManagement: true,
-		Summary:        "all except management",
+		HardwareUnsupported: "keep-management means \"everything except SSH, DNS, ARP and " +
+			"neighbour discovery\", and hardware steering can only say what to take, not " +
+			"what to leave; use --rx-mode udp-port, tcp-port or cidr with --io mlx5",
+		Summary: "all except management",
 		Redirects: fmt.Sprintf(
 			"Everything except management. Every packet %s receives is taken by Wireblast, "+
 				"but SSH and DNS to and from this host, plus ARP and IPv6 neighbour discovery, "+
@@ -225,6 +269,7 @@ func planAll(cfg *config.Config) (FilterPlan, error) {
 	return FilterPlan{
 		receives:  true,
 		Matches:   []afxdp.Match{afxdp.MatchAll()},
+		Steering:  packetio.SteeringFilter{Promiscuous: true},
 		Summary:   "all",
 		Dangerous: true,
 		Redirects: fmt.Sprintf(

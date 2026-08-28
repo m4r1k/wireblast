@@ -1,6 +1,9 @@
 package dataplane
 
 import (
+	"github.com/atoonk/packetio"
+	pioafxdp "github.com/atoonk/packetio/afxdp"
+
 	"context"
 	"errors"
 	"fmt"
@@ -55,7 +58,15 @@ const (
 type Info struct {
 	Interface string
 	Driver    string
-	Queues    int
+	// Backend is the packet-I/O backend this run resolved to, "afxdp" or
+	// "mlx5". BackendWhy says why, when the choice was made rather than
+	// asked for; Sizing says the same for the queue count.
+	Backend    string
+	BackendWhy string
+	Sizing     string
+	Queues     int
+	// PerWorker is how many transmit queues one worker drives.
+	PerWorker int
 	XDPMode   string // "native", "generic", ...
 	ZeroCopy  bool
 	Filter    string
@@ -84,16 +95,38 @@ type Info struct {
 }
 
 // String renders Info as the single line printed at startup.
+// Workers is how many goroutines drive this run's transmit queues.
+func (i Info) Workers() int {
+	if i.PerWorker < 2 {
+		return i.Queues
+	}
+	return (i.Queues + i.PerWorker - 1) / i.PerWorker
+}
+
 func (i Info) String() string {
 	zc := "copy"
 	if i.ZeroCopy {
 		zc = "zero-copy"
 	}
-	s := fmt.Sprintf("%s: %d queue(s), %s, %s XDP", i.Interface, i.Queues, zc, i.XDPMode)
+	var s string
+	if i.Backend == "mlx5" {
+		// Direct Verbs has no XDP program and no copy mode to report; what
+		// matters instead is how the queues are shared between workers.
+		s = fmt.Sprintf("%s: %d queue(s) over %d worker(s), mlx5 Direct Verbs",
+			i.Interface, i.Queues, i.Workers())
+	} else {
+		s = fmt.Sprintf("%s: %d queue(s), %s, %s XDP", i.Interface, i.Queues, zc, i.XDPMode)
+	}
+	if i.BackendWhy != "" {
+		s += " (" + i.BackendWhy + ")"
+	}
+	if i.Sizing != "" {
+		s += ", " + i.Sizing
+	}
 	if i.MultiBuffer {
 		s += ", multi-buffer"
 	}
-	if i.Driver != "" {
+	if i.Driver != "" && i.Backend != "mlx5" {
 		s += ", driver " + i.Driver
 	}
 	if i.Filter != "" {
@@ -120,9 +153,17 @@ type Runner struct {
 	collector *stats.Collector
 
 	fleet *afxdp.Fleet
-	info  Info
+	// dev is the datapath's view of the fleet: the transmit and receive loops
+	// go through packetio so the same code runs over either backend.
+	dev  packetio.Device
+	info Info
 
-	queues    int
+	queues int
+
+	// io is the resolved backend, "afxdp" or "mlx5" — cfg.IO after "auto" has
+	// been decided. perWorker is how many transmit queues one worker drives.
+	io        string
+	perWorker int
 	numFrames int
 	frameSize int
 	maxFrame  int
@@ -187,19 +228,21 @@ func New(cfg *config.Config, res *discovery.Resolved, opts Options) (*Runner, er
 		return nil, err
 	}
 
-	queues := res.Link.RxQueues
-	if cfg.Queues > 0 && cfg.Queues < queues {
-		queues = cfg.Queues
+	io, ioWhy := chooseBackend(cfg, res, plan)
+	if io == "mlx5" && plan.HardwareUnsupported != "" {
+		return nil, fmt.Errorf("--io mlx5 cannot run --rx-mode %s: %s", cfg.RxMode, plan.HardwareUnsupported)
 	}
-	if queues < 1 {
-		queues = 1
+	if io != "mlx5" && cfg.QueuesPerWorker > 1 {
+		return nil, fmt.Errorf("--queues-per-worker %d needs the mlx5 backend, and this run uses AF_XDP (%s)",
+			cfg.QueuesPerWorker, orUnknown(ioWhy))
 	}
 
 	r := &Runner{
 		cfg:       cfg,
 		res:       res,
 		plan:      plan,
-		queues:    queues,
+		io:        io,
+		queues:    1,
 		frames:    opts.Frames,
 		session:   opts.Session,
 		numFrames: orDefault(opts.NumFrames, defaultNumFrames),
@@ -209,9 +252,10 @@ func New(cfg *config.Config, res *discovery.Resolved, opts Options) (*Runner, er
 		r.logf = func(string, ...any) {}
 	}
 
-	// Build one generator per queue up front: it validates the configuration
-	// and tells us the largest frame, which sizes the UMEM. A receive-only run
-	// has none, and sizes its frames for the largest thing it might be sent.
+	// Build one generator up front: it validates the configuration and tells
+	// us the largest frame, which sizes the UMEM and, on mlx5, decides the
+	// queue count. A receive-only run has none, and sizes its frames for the
+	// largest thing it might be sent.
 	sizes := "not transmitting"
 	if cfg.Transmits() {
 		gens, err := r.buildGenerators()
@@ -230,6 +274,20 @@ func New(cfg *config.Config, res *discovery.Resolved, opts Options) (*Runner, er
 	r.frameSize = orDefault(opts.FrameSize, frameSizeFor(r.maxFrame, res.Link.Driver))
 	r.multiBuffer = multiBufferFor(r.maxFrame, r.frameSize)
 
+	// Now that the frame size is known, size the run: how many queues, and
+	// how many one worker drives. Build the generators again at that count,
+	// so a configuration that cannot be striped across them fails here rather
+	// than at Start.
+	// maxFrame is bytes written, which excludes the FCS the NIC appends; line
+	// rate counts the whole frame, and so does --packet-size.
+	queues, perWorker, sizeWhy := autoQueues(io, cfg, res.Link, r.maxFrame+config.FCSLen)
+	r.queues, r.perWorker = queues, perWorker
+	if cfg.Transmits() {
+		if _, err := r.buildGenerators(); err != nil {
+			return nil, err
+		}
+	}
+
 	r.limiter = rate.New(cfg.PPS, cfg.BPS, rate.WithBatch(txBatch))
 	statsOpts := []stats.Option{}
 	if !cfg.Transmits() {
@@ -239,7 +297,11 @@ func New(cfg *config.Config, res *discovery.Resolved, opts Options) (*Runner, er
 	r.info = Info{
 		Interface:   res.Link.Name,
 		Driver:      res.Link.Driver,
+		Backend:     io,
+		BackendWhy:  ioWhy,
+		Sizing:      sizeWhy,
 		Queues:      queues,
+		PerWorker:   perWorker,
 		Filter:      plan.Summary,
 		FrameSize:   r.frameSize,
 		NumFrames:   r.numFrames,
@@ -342,6 +404,7 @@ func (r *Runner) Preflight(src discovery.Source) *Preflight {
 	return RunPreflight(PreflightInput{
 		Cfg: r.cfg, Res: r.res, Plan: r.plan,
 		Env:         HostEnvironment(src),
+		Backend:     r.io,
 		Queues:      r.queues,
 		MaxFrameLen: r.maxFrame,
 		NumFrames:   r.numFrames,
@@ -414,7 +477,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	// that comes back quickly costs nothing; linkWait is only the ceiling.
 	// A reused attachment never bounced anything, so there is nothing to wait
 	// for — which is the entire point of keeping it.
-	if r.res.Link.IsPhysical() && !r.info.Reused {
+	if r.fleet != nil && r.res.Link.IsPhysical() && !r.info.Reused {
 		began := time.Now()
 		up := r.fleet.WaitLinkUp(linkWait)
 		r.mu.Lock()
@@ -452,28 +515,56 @@ func (r *Runner) Start(ctx context.Context) error {
 	r.collector.Sample()
 
 	r.txActive.Store(int32(len(gens)))
-	for q, xsk := range r.fleet.Sockets() {
-		if q >= r.queues {
-			break
+	perWorker := r.perWorker
+	if perWorker < 1 {
+		perWorker = 1
+	}
+	nq := r.dev.NumTxQueues()
+	if nq > r.queues {
+		nq = r.queues
+	}
+
+	// txActive counts workers, not queues: a group that finishes is one
+	// generator set exhausted, and the run ends when the last group does.
+	if perWorker > 1 {
+		r.txActive.Store(int32((len(gens) + perWorker - 1) / perWorker))
+	}
+	for first := 0; first < nq; first += perWorker {
+		last := first + perWorker
+		if last > nq {
+			last = nq
 		}
-		if q < len(gens) {
+		if first < len(gens) {
+			if last > len(gens) {
+				last = len(gens)
+			}
+			qs := make([]packetio.TxQueue, 0, last-first)
+			for q := first; q < last; q++ {
+				qs = append(qs, r.dev.TxQueue(q))
+			}
 			r.wg.Add(1)
-			go func(q int, xsk *afxdp.Socket, g generator.Generator) {
+			go func(first int, qs []packetio.TxQueue, gs []generator.Generator) {
 				defer r.wg.Done()
-				r.txLoop(runCtx, q, xsk, g)
+				if len(qs) == 1 {
+					r.txLoop(runCtx, first, qs[0], gs[0])
+				} else {
+					r.txLoopMulti(runCtx, first, qs, gs)
+				}
 				if r.txActive.Add(-1) == 0 {
 					// Every generator is exhausted — a one-pass replay is done.
 					stop()
 				}
-			}(q, xsk, gens[q])
+			}(first, qs, gens[first:last])
 		}
+	}
 
-		if r.plan.Receives() {
+	if r.plan.Receives() {
+		for q := 0; q < r.dev.NumRxQueues() && q < r.queues; q++ {
 			r.wg.Add(1)
-			go func(q int, xsk *afxdp.Socket) {
+			go func(q int, rx packetio.RxQueue) {
 				defer r.wg.Done()
-				r.rxLoop(runCtx, q, xsk)
-			}(q, xsk)
+				r.rxLoop(runCtx, q, rx)
+			}(q, r.dev.RxQueue(q))
 		}
 	}
 
@@ -644,6 +735,28 @@ func (r *Runner) attach() error {
 		return afxdp.Open(r.res.Link.Name, opts...)
 	}
 
+	if r.io == "mlx5" {
+		// Direct Verbs: no program to attach, no filter, and nothing to reuse
+		// between runs, so none of the fleet machinery below applies.
+		frames := nextPow2(r.queues * (r.umemOptions().NumFrames))
+		dev, steering, err := openMLX5(r.res.Link.Name, r.queues, r.frameSize, frames,
+			r.plan.Steering, !r.plan.Receives())
+		if err != nil {
+			return err
+		}
+		r.dev = dev
+		r.started = true
+		if steering != "" {
+			// What the card was actually told, so the startup line shows the
+			// rule and not just the intent.
+			r.info.Filter = steering
+		}
+		r.info.Queues = dev.NumTxQueues()
+		r.info.FrameSize = r.frameSize
+		r.info.NumFrames = frames
+		return nil
+	}
+
 	var (
 		fleet  *afxdp.Fleet
 		reused bool
@@ -658,6 +771,7 @@ func (r *Runner) attach() error {
 		return fmt.Errorf("open AF_XDP on %s: %w", r.res.Link.Name, err)
 	}
 	r.fleet = fleet
+	r.dev = pioafxdp.NewDevice(fleet)
 	r.started = true
 	r.info.Reused = reused
 
@@ -686,12 +800,22 @@ func (r *Runner) attach() error {
 func (r *Runner) close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed || r.fleet == nil {
+	if r.closed || (r.fleet == nil && r.dev == nil) {
 		return
 	}
 	r.closed = true
+	if r.fleet == nil {
+		// A backend that owns no fleet: the device is the whole thing.
+		dev := r.dev
+		r.dev = nil
+		if dev != nil {
+			_ = dev.Close()
+		}
+		return
+	}
 	fleet := r.fleet
 	r.fleet = nil
+	r.dev = nil
 	if r.session != nil {
 		return // still attached, and still the session's to close
 	}
@@ -704,17 +828,18 @@ func (r *Runner) close() {
 // reclaims the completions, so the final statistics are not short.
 func (r *Runner) drain() {
 	r.mu.Lock()
-	fleet := r.fleet
+	dev := r.dev
 	r.mu.Unlock()
-	if fleet == nil {
+	if dev == nil {
 		return
 	}
 	deadline := time.Now().Add(200 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		pending := 0
-		for _, xsk := range fleet.Sockets() {
-			xsk.Complete(xsk.NumCompleted())
-			pending += xsk.NumTransmitted()
+		for q := 0; q < dev.NumTxQueues(); q++ {
+			tx := dev.TxQueue(q)
+			tx.Complete(tx.NumCompleted())
+			pending += tx.NumInFlight()
 		}
 		if pending == 0 {
 			return
@@ -820,4 +945,13 @@ func subtractKernel(a, b stats.Kernel) stats.Kernel {
 		})
 	}
 	return out
+}
+
+// nextPow2 rounds up to a power of two, which is what the frame region wants.
+func nextPow2(n int) int {
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	return p
 }

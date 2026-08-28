@@ -14,6 +14,7 @@ require (
 )
 
 require (
+	github.com/atoonk/packetio v0.0.0
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/colorprofile v0.4.1 // indirect
@@ -41,3 +42,7 @@ require (
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 )
+
+replace github.com/atoonk/packetio => /home/ubuntu/packetio
+
+replace github.com/atoonk/go-afxdp => /home/ubuntu/go-afxdp

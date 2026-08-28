@@ -107,6 +107,62 @@ They cover benchmarking a link, IMIX, PCAP replay, flow hashing, VLAN tagging, r
 
 ---
 
+## Direct Verbs on ConnectX cards
+
+On a Mellanox/NVIDIA ConnectX card Wireblast can bypass AF_XDP entirely and
+talk to the hardware through mlx5 Direct Verbs. It is several times cheaper per
+packet, because it skips the kernel's transmit path and drives the send queues
+from userspace:
+
+| | 100G at 68-byte frames | cores |
+|---|---:|---:|
+| AF_XDP | 139.8 Mpps | 41.0 |
+| Direct Verbs | 141.4 Mpps | **4.0** |
+
+Both reach line rate. One does it on four cores.
+
+It needs cgo and rdma-core, so it is behind a build tag — the ordinary binary
+stays a single static file that runs anywhere:
+
+```bash
+go build -tags mlx5 -o wireblast ./cmd/wireblast
+sudo modprobe ib_uverbs mlx5_ib     # if /dev/infiniband is empty
+```
+
+There is nothing to configure. `--io` defaults to `auto`, which picks Direct
+Verbs when the card is a ConnectX, the binary has the backend, and the run only
+transmits; anything that receives stays on AF_XDP, because receive filters are
+XDP programs and a steering rule cannot express all of them. The queue count
+and how many queues a worker drives are derived from the link speed and the
+frame size, and the startup line says what was chosen and why:
+
+```
+started: eno2: 16 queue(s) over 4 worker(s), mlx5 Direct Verbs
+         (ConnectX card, transmit only), sized for 100G at 68-byte frames
+```
+
+Measured on a ConnectX-6 Dx behind an EPYC 9275F, with no flags but
+`--packet-size`:
+
+| frame | line rate | workers chosen | achieved | cores |
+|---:|---:|---:|---:|---:|
+| 68 B | 142.0 Mpps | 4 | 141.4 Mpps | 3.98 |
+| 128 B | 84.5 Mpps | 3 | 83.9 Mpps | 2.98 |
+| 196 B | 57.9 Mpps | 4 | 58.3 Mpps | 3.98 |
+| 256 B | 45.3 Mpps | 5 | 45.2 Mpps | 4.96 |
+| 512 B | 23.5 Mpps | 3 | 23.5 Mpps | 2.98 |
+| 1500 B | 8.2 Mpps | 1 | 8.2 Mpps | 1.00 |
+
+The jump in cost between 196 and 256 bytes is the card's inline threshold: up
+to 192 bytes the packet is copied into the descriptor, above it the card
+fetches the packet itself, which costs a flat ~425 cycles however big it is.
+
+`--io afxdp` forces the kernel path, `--io mlx5` insists on Direct Verbs and
+fails with a reason if it is unavailable, and `--queues` / `--queues-per-worker`
+override the derived sizing.
+
+---
+
 ## For developers
 
 Everything above is covered in depth in the [docs](https://wireblast.mintlify.site); this section is for working on Wireblast itself.
@@ -141,7 +197,7 @@ The command is a thin shell; the work is in `internal/`:
 | `internal/generator` | turns a config into a stream of frames (flows, IMIX, raw, PCAP) |
 | `internal/pcapfile` | pure-Go loader for Ethernet `.pcap` / `.pcapng` captures |
 | `internal/rate` | the aggregate token-bucket rate limiter |
-| `internal/dataplane` | everything AF_XDP: opening sockets, the XDP filter, the run loop |
+| `internal/dataplane` | packet I/O: AF_XDP sockets and the XDP filter, mlx5 Direct Verbs, backend choice, the run loop |
 | `internal/stats` | atomic counters, rate snapshots, history |
 | `internal/tui` | the interactive wizard and live dashboard (Bubble Tea) |
 | `internal/prefs` | remembers your last run under `~/.wireblast/` |

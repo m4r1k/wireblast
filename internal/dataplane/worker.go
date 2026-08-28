@@ -6,11 +6,16 @@ import (
 	"runtime"
 	"time"
 
-	afxdp "github.com/atoonk/go-afxdp"
+	"github.com/atoonk/packetio"
 
 	"github.com/atoonk/wireblast/internal/generator"
 	"github.com/atoonk/wireblast/internal/stats"
 )
+
+// errNoBatchSender is what a jumbo run gets from a backend that cannot spread a
+// packet over several frames. Preflight refuses that combination, so reaching
+// this means the check was skipped rather than that the run should continue.
+var errNoBatchSender = errors.New("dataplane: this backend cannot send a packet larger than one frame")
 
 // fcsLen is the frame check sequence the NIC appends. Wireblast never writes
 // it, but counts it, so reported frame sizes match --packet-size.
@@ -63,7 +68,7 @@ func (a *txAccum) add(n int, class stats.Class) {
 // Nothing in the steady state allocates: the generator writes straight into
 // the UMEM frame, the rate limiter hands out batch credit, and the counters
 // are atomics updated once per batch.
-func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen generator.Generator) {
+func (r *Runner) txLoop(ctx context.Context, queue int, xsk packetio.TxQueue, gen generator.Generator) {
 	ctr := r.collector.Queue(queue)
 	el := newErrLog(r.logf)
 	sleeper := newSleeper()
@@ -78,9 +83,13 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 	// it worked: owning a core decides how this loop may wait on a full ring,
 	// in the branch below. Pinning here rather than letting the first send do
 	// it means the answer is known before the loop needs it.
-	cpu, err := xsk.Pin()
-	if err != nil {
-		el.printf("queue %d: %v", queue, err)
+	cpu := -1
+	if p, ok := xsk.(pinner); ok {
+		c, err := p.Pin()
+		if err != nil {
+			el.printf("queue %d: %v", queue, err)
+		}
+		cpu = c
 	}
 	pinned := cpu >= 0
 
@@ -244,7 +253,7 @@ func (r *Runner) txLoop(ctx context.Context, queue int, xsk *afxdp.Socket, gen g
 // frames, paying one copy per packet. That is affordable precisely because a
 // packet needing chaining is at least a frame long, so the packet rate is low.
 func (r *Runner) sender(
-	xsk *afxdp.Socket,
+	xsk packetio.TxQueue,
 	gen generator.Generator,
 	acc *txAccum,
 ) (int, func(want int) (int, error)) {
@@ -297,7 +306,11 @@ func (r *Runner) sender(
 			// on both paths rather than spinning on an empty batch.
 			return 0, errNothingBuilt
 		}
-		sent, err := xsk.SendBatch(payloads[:built])
+		batcher, ok := xsk.(batchSender)
+		if !ok {
+			return 0, errNoBatchSender
+		}
+		sent, err := batcher.SendBatch(payloads[:built])
 		if err != nil {
 			return 0, err
 		}
@@ -317,7 +330,8 @@ func (r *Runner) sender(
 // The per-packet work is deliberately tiny: a length and a three-way protocol
 // classification from fixed header offsets. Anything more belongs outside the
 // dataplane.
-func (r *Runner) rxLoop(ctx context.Context, queue int, xsk *afxdp.Socket) {
+func (r *Runner) rxLoop(ctx context.Context, queue int, xsk packetio.RxQueue) {
+	region := xsk.Region()
 	ctr := r.collector.Queue(queue)
 	el := newErrLog(r.logf)
 
@@ -347,16 +361,28 @@ func (r *Runner) rxLoop(ctx context.Context, queue int, xsk *afxdp.Socket) {
 		// free when nothing chains: with multi-buffer off every packet has
 		// exactly one fragment. The two must not be mixed on one socket either,
 		// since ReceivePackets carries partial-chain state between calls.
-		pkts := xsk.ReceivePackets(n)
-		for _, p := range pkts {
-			if len(p) == 0 {
-				continue
+		if pr, ok := xsk.(packetReceiver); ok {
+			pkts := pr.ReceivePackets(n)
+			for _, p := range pkts {
+				if len(p) == 0 {
+					continue
+				}
+				// Length is the whole packet, and only the first fragment
+				// carries the headers Classify reads.
+				first := packetio.Desc{Addr: p[0].Addr, Len: p[0].Len, Options: p[0].Options}
+				ctr.AddRx(uint64(p.Len()+fcsLen), generator.Classify(region.Frame(first)))
 			}
-			// Length is the whole packet, and only the first fragment carries
-			// the headers Classify reads.
-			ctr.AddRx(uint64(p.Len()+fcsLen), generator.Classify(xsk.GetFrame(p[0])))
+			pr.RecyclePackets(pkts)
+			continue
 		}
-		xsk.RecyclePackets(pkts)
+
+		// A backend that cannot chain frames gives one descriptor per packet,
+		// which is the same thing when nothing chains.
+		descs := xsk.Receive(n)
+		for _, d := range descs {
+			ctr.AddRx(uint64(d.Len+fcsLen), generator.Classify(region.Frame(d)))
+		}
+		xsk.Recycle(descs)
 	}
 }
 
@@ -451,4 +477,110 @@ func (e *errLog) printf(format string, args ...any) {
 	e.logf(format, args...)
 	e.last = time.Now()
 	e.suppressed = 0
+}
+
+// txLoopMulti drives several transmit queues from one goroutine.
+//
+// It exists because the two backends want opposite things. An AF_XDP socket's
+// transmit work happens in a soft interrupt on its own queue's core, so giving
+// one worker several sockets only spreads that work wider — measured, it loses.
+// An mlx5 send queue has no interrupt at all and tops out near 17 million
+// packets a second whatever drives it, so a core that owns one queue is idle
+// most of the time and a core that owns four is not.
+//
+// This is the plain max-rate path only: no capture pacing and no one-pass
+// replay, both of which want a queue to themselves. Config refuses the
+// combination rather than quietly ignoring it.
+func (r *Runner) txLoopMulti(ctx context.Context, first int, qs []packetio.TxQueue, gens []generator.Generator) {
+	el := newErrLog(r.logf)
+	sleeper := newSleeper()
+	defer sleeper.stop()
+	stall := newTxStall()
+
+	// Placement is asked for once, on the first queue: the rest of this
+	// worker's queues must not drag it anywhere else.
+	if p, ok := qs[0].(pinner); ok {
+		if _, err := p.Pin(); err != nil {
+			el.printf("queues %d-%d: %v", first, first+len(qs)-1, err)
+		}
+	}
+
+	type lane struct {
+		queue    int
+		ctr      *stats.Counters
+		acc      *txAccum
+		batchCap int
+		send     func(want int) (int, error)
+		avgWire  int
+	}
+	lanes := make([]lane, len(qs))
+	for i := range qs {
+		acc := &txAccum{}
+		batchCap, send := r.sender(qs[i], gens[i], acc)
+		lanes[i] = lane{
+			queue: first + i, ctr: r.collector.Queue(first + i),
+			acc: acc, batchCap: batchCap, send: send,
+			avgWire: gens[i].AvgWireBytes(),
+		}
+	}
+
+	next := 0
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		// Round-robin: while one queue is full the others have room, and the
+		// core has time to fill them. That is the whole point of being here.
+		l := &lanes[next]
+		if next++; next == len(lanes) {
+			next = 0
+		}
+
+		grant, wait := r.limiter.Acquire(l.batchCap, l.avgWire)
+		if grant.Packets == 0 {
+			stall.clear()
+			if !sleeper.sleep(ctx, wait) {
+				return
+			}
+			continue
+		}
+
+		*l.acc = txAccum{}
+		sent, err := l.send(grant.Packets)
+		switch {
+		case err != nil && closedSocket(err):
+			return
+		case err != nil:
+			l.ctr.TxErrors.Add(1)
+			r.limiter.Settle(grant, 0, 0)
+			if l.acc.buildErrs == 0 {
+				el.printf("queue %d: transmit: %v", l.queue, err)
+			}
+			if l.acc.buildErrs > 0 {
+				return
+			}
+			continue
+		}
+
+		for c := range l.acc.clsPkts {
+			if l.acc.clsPkts[c] > 0 {
+				l.ctr.AddTx(l.acc.clsPkts[c], l.acc.clsBytes[c], stats.Class(c))
+			}
+		}
+		r.limiter.Settle(grant, sent, l.acc.bytes+uint64(sent)*wireOverhead)
+
+		if sent == 0 {
+			// Every queue this worker owns was full. Only then is it worth
+			// waiting; with several queues that is a much rarer thing than it
+			// is with one, which is why this loop rarely sleeps at all.
+			if !stall.backoff() {
+				continue
+			}
+			if !sleeper.sleep(ctx, txStallBackoff) {
+				return
+			}
+			continue
+		}
+		stall.clear()
+	}
 }

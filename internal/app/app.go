@@ -118,8 +118,13 @@ func RunNonInteractive(ctx context.Context, cfg *config.Config, out io.Writer) e
 
 	// Attaching native XDP bounces the link, which can take ten seconds on a
 	// 10G NIC. Show that something is happening rather than going silent.
-	stopWait := progress(out, fmt.Sprintf("attaching XDP to %s and waiting for the link",
-		p.Resolved.Link.Name))
+	// Direct Verbs attaches no program and bounces nothing, so it gets the
+	// honest message instead.
+	opening := fmt.Sprintf("attaching XDP to %s and waiting for the link", p.Resolved.Link.Name)
+	if p.Runner.Info().Backend == "mlx5" {
+		opening = fmt.Sprintf("opening %s through Direct Verbs", p.Resolved.Link.Name)
+	}
+	stopWait := progress(out, opening)
 	err = p.Runner.Start(ctx)
 	stopWait()
 	if err != nil {
