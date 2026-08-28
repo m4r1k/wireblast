@@ -229,7 +229,9 @@ func RunPreflight(in PreflightInput) *Preflight {
 				fmt.Sprintf("%s has rx-vlan-filter on and nothing has registered VLAN %d with the "+
 					"kernel, so the card drops tagged frames before the XDP program sees them. "+
 					"A receive run would report zero packets and no error. --io mlx5 does not "+
-					"have this problem: it steers in its own flow table, below the filter.",
+					"have this problem: it steers in its own flow table, below the filter. "+
+					"Note this is one of two things that produce an idle-looking AF_XDP "+
+					"receive; the other is binding fewer queues than the card has.",
 					in.Res.Link.Name, in.Cfg.VLAN),
 				fmt.Sprintf("Register the VLAN, which is the smaller change:\n"+
 					"  sudo ip link add link %s name %s.%d type vlan id %d\n"+
@@ -239,6 +241,29 @@ func RunPreflight(in PreflightInput) *Preflight {
 					in.Res.Link.Name, in.Res.Link.Name, in.Cfg.VLAN, in.Cfg.VLAN,
 					in.Res.Link.Name, in.Cfg.VLAN, in.Res.Link.Name))
 		}
+	}
+
+	// AF_XDP binds one socket per queue, numbered from zero, and the XDP program
+	// redirects a packet by the queue it arrived on. A queue with no socket is
+	// passed to the kernel, silently and by design. So receiving on fewer queues
+	// than the card has means the card's hash decides whether anything arrives
+	// at all: a single flow lands on exactly one queue, and if that queue is
+	// above the range bound here, the run reports zero with nothing wrong.
+	//
+	// Verified on a 48-queue ConnectX: four queues received nothing, forty-eight
+	// received every packet offered.
+	if in.Backend == "afxdp" && in.Plan.receives && in.Queues > 0 &&
+		in.Res.Link.RxQueues > in.Queues {
+		add(LevelWarn, "receiving on some of the card's queues, not all",
+			fmt.Sprintf("%s has %d receive queues and this run binds %d. A packet is delivered "+
+				"to the socket on the queue the card hashed it to, and a queue with no socket "+
+				"goes to the kernel instead -- so traffic that is few flows, or unlucky, will "+
+				"be missed entirely and the run will look idle rather than wrong.",
+				in.Res.Link.Name, in.Res.Link.RxQueues, in.Queues),
+			fmt.Sprintf("Bind them all:\n  --queues %d\n"+
+				"or narrow what the card spreads, with ethtool -X. --io mlx5 does not have "+
+				"this problem: its steering rule delivers to the group whatever the hash says.",
+				in.Res.Link.RxQueues))
 	}
 
 	// Privileges.

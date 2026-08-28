@@ -202,3 +202,50 @@ func TestVLANRegistered(t *testing.T) {
 		t.Error("found a VLAN among no links")
 	}
 }
+
+// Binding fewer queues than the card has is the second way an AF_XDP receive
+// silently gets nothing: the card hashes a flow to one queue, and a queue with
+// no socket goes to the kernel. Measured on a 48-queue ConnectX -- four queues
+// received nothing of 200 kpps, forty-eight received all of it.
+func TestPreflightWarnsOnPartialQueueBinding(t *testing.T) {
+	link := discovery.Link{Name: "eno2", Index: 3, RxQueues: 48, Up: true, Carrier: true,
+		MAC: []byte{2, 0, 0, 0, 0, 1}, Driver: "mlx5_core", MTU: 1500}
+	in := PreflightInput{
+		Cfg:     &config.Config{Interface: "eno2", RxMode: config.RxUDPPort, RxPorts: []uint16{9000}},
+		Res:     &discovery.Resolved{Link: link},
+		Plan:    FilterPlan{receives: true},
+		Backend: "afxdp",
+		Queues:  4,
+	}
+	var found *Check
+	for i, c := range RunPreflight(in).Checks {
+		if strings.Contains(c.Title, "queues") {
+			found = &RunPreflight(in).Checks[i]
+		}
+	}
+	if found == nil {
+		t.Fatal("no warning about binding 4 of 48 queues")
+	}
+	for _, want := range []string{"48", "4", "--queues 48"} {
+		if !strings.Contains(found.Detail+found.Fix, want) {
+			t.Errorf("the warning does not mention %q:\n%s\n%s", want, found.Detail, found.Fix)
+		}
+	}
+
+	// Binding all of them is the normal case and must be silent.
+	in.Queues = 48
+	for _, c := range RunPreflight(in).Checks {
+		if strings.Contains(c.Title, "queues") {
+			t.Errorf("warned when binding every queue: %s", c.Detail)
+		}
+	}
+
+	// So is a transmit-only run, which receives nothing by definition.
+	in.Queues = 4
+	in.Plan = FilterPlan{}
+	for _, c := range RunPreflight(in).Checks {
+		if strings.Contains(c.Title, "queues") {
+			t.Errorf("warned a transmit-only run about receive queues: %s", c.Detail)
+		}
+	}
+}
