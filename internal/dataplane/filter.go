@@ -80,6 +80,27 @@ type DefaultFilterBuilder struct{}
 
 // Plan builds the filter for a run.
 func (DefaultFilterBuilder) Plan(cfg *config.Config, res *discovery.Resolved) (FilterPlan, error) {
+	p, err := planFor(cfg, res)
+	if err != nil {
+		return p, err
+	}
+	// The XDP program has no VLAN match, so the run's VLAN reaches the hardware
+	// steering filter and not the eBPF one. On a tagged interface that makes
+	// the AF_XDP filter strictly wider than what was asked for, and the only
+	// honest thing to do is say so: the two backends install measurably
+	// different filters from identical flags.
+	// Not for a promiscuous plan: --rx-mode all takes everything on both
+	// backends, so there is no difference between them to warn about.
+	if p.receives && cfg.VLAN > 0 && !p.Steering.Promiscuous {
+		p.Limitations = append(p.Limitations, fmt.Sprintf(
+			"On --io afxdp the VLAN id is not matched: the XDP program has no VLAN match, so "+
+				"this filter takes the traffic it names on VLAN %d, on any other VLAN, and "+
+				"untagged alike. --io mlx5 matches the id in hardware.", cfg.VLAN))
+	}
+	return p, nil
+}
+
+func planFor(cfg *config.Config, res *discovery.Resolved) (FilterPlan, error) {
 	switch cfg.RxMode {
 	case config.RxNone:
 		return planNone(cfg), nil

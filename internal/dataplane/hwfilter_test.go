@@ -114,3 +114,91 @@ func TestExplicitMLX5RefusesKeepManagement(t *testing.T) {
 		t.Errorf("error does not name the mode: %v", err)
 	}
 }
+
+// The two backends install different filters from the same flags, because the
+// XDP program has no VLAN match and hardware steering does. That is a real
+// difference in what gets captured, so the plan has to admit it rather than let
+// the user believe the AF_XDP filter is as narrow as the mlx5 one.
+func TestAFXDPFilterAdmitsItIgnoresTheVLAN(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		cfg  *config.Config
+	}{
+		{"udp-port", &config.Config{Interface: "eth0", VLAN: 2053, RxMode: config.RxUDPPort,
+			RxPorts: []uint16{9001}, Mode: config.ModeUDP}},
+		{"cidr", &config.Config{Interface: "eth0", VLAN: 2053, RxMode: config.RxCIDR,
+			RxCIDR: "198.51.100.0/24", Mode: config.ModeUDP}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			p, err := DefaultFilterBuilder{}.Plan(mode.cfg, &discovery.Resolved{})
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+			var said bool
+			for _, l := range p.Limitations {
+				if strings.Contains(l, "VLAN id is not matched") && strings.Contains(l, "2053") {
+					said = true
+				}
+			}
+			if !said {
+				t.Errorf("no limitation says the AF_XDP filter ignores the VLAN:\n%v", p.Limitations)
+			}
+			// The hardware filter still matches it; that is the difference.
+			if k := kinds(p.Steering); k[packetio.MatchKindVLAN] != 1 {
+				t.Errorf("hardware filter has %d VLAN matches, want 1", k[packetio.MatchKindVLAN])
+			}
+		})
+	}
+}
+
+// --rx-mode all is promiscuous on both backends, so there is no narrowing to
+// misrepresent and the note would be noise.
+func TestNoVLANNoteForPromiscuous(t *testing.T) {
+	cfg := &config.Config{Interface: "eth0", VLAN: 2053, RxMode: config.RxAll,
+		Mode: config.ModeUDP, AllowMatchAll: true}
+	p, err := DefaultFilterBuilder{}.Plan(cfg, &discovery.Resolved{})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	for _, l := range p.Limitations {
+		if strings.Contains(l, "VLAN id is not matched") {
+			t.Errorf("promiscuous plan warned about VLAN matching: %q", l)
+		}
+	}
+}
+
+// A run that is not receiving has no filter to be wrong about.
+func TestNoVLANNoteWhenNotReceiving(t *testing.T) {
+	cfg := &config.Config{Interface: "eth0", VLAN: 2053, RxMode: config.RxNone, Mode: config.ModeUDP}
+	p, err := DefaultFilterBuilder{}.Plan(cfg, &discovery.Resolved{})
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	for _, l := range p.Limitations {
+		if strings.Contains(l, "VLAN id is not matched") {
+			t.Errorf("transmit-only run warned about receive filtering: %q", l)
+		}
+	}
+}
+
+// vlanRegistered is what decides whether the preflight refuses an AF_XDP
+// receive on a tagged interface, so it has to agree with what the kernel would
+// actually accept: a sub-interface for this id, on this parent.
+func TestVLANRegistered(t *testing.T) {
+	parent := discovery.Link{Name: "eno2", Index: 3}
+	other := discovery.Link{Name: "eno1", Index: 2}
+	links := []discovery.Link{
+		parent, other,
+		{Name: "eno2.2043", Index: 9, VLANID: 2043, ParentIndex: 3},
+		{Name: "eno1.2053", Index: 10, VLANID: 2053, ParentIndex: 2}, // right id, wrong parent
+	}
+	if vlanRegistered(links, parent, 2053) {
+		t.Error("2053 reported as registered on eno2; the only 2053 is on eno1")
+	}
+	if !vlanRegistered(links, parent, 2043) {
+		t.Error("2043 is registered on eno2 and was not found")
+	}
+	if vlanRegistered(nil, parent, 2053) {
+		t.Error("found a VLAN among no links")
+	}
+}

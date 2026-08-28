@@ -213,6 +213,34 @@ func RunPreflight(in PreflightInput) *Preflight {
 		p.Checks = append(p.Checks, Check{Level: l, Title: title, Detail: detail, Fix: fix})
 	}
 
+	// AF_XDP receive on a tagged interface, where the kernel is filtering by
+	// VLAN id. The card drops a tag the kernel never registered, before the XDP
+	// program runs, so the filter matches nothing and the run reports zero
+	// packets with no error anywhere. Direct Verbs is immune: its steering rule
+	// carries the id and lives in this process's own flow table, below the
+	// netdev VLAN filter entirely.
+	//
+	// This is a refusal rather than a fix. Registering a VLAN or turning the
+	// filter off changes the host's networking, and this program does not do
+	// that on the user's behalf.
+	if in.Backend == "afxdp" && in.Plan.receives && in.Cfg.VLAN > 0 && !in.Res.Link.IsVLAN() {
+		if on, known := vlanFilterOn(in.Res.Link.Name); known && on && !vlanRegistered(in.AllLinks, in.Res.Link, in.Cfg.VLAN) {
+			add(LevelFatal, "the kernel is filtering out this VLAN",
+				fmt.Sprintf("%s has rx-vlan-filter on and nothing has registered VLAN %d with the "+
+					"kernel, so the card drops tagged frames before the XDP program sees them. "+
+					"A receive run would report zero packets and no error. --io mlx5 does not "+
+					"have this problem: it steers in its own flow table, below the filter.",
+					in.Res.Link.Name, in.Cfg.VLAN),
+				fmt.Sprintf("Register the VLAN, which is the smaller change:\n"+
+					"  sudo ip link add link %s name %s.%d type vlan id %d\n"+
+					"  sudo ip link set %s.%d up\n"+
+					"or turn the filter off for the whole interface:\n"+
+					"  sudo ethtool -K %s rx-vlan-filter off",
+					in.Res.Link.Name, in.Res.Link.Name, in.Cfg.VLAN, in.Cfg.VLAN,
+					in.Res.Link.Name, in.Cfg.VLAN, in.Res.Link.Name))
+		}
+	}
+
 	// Privileges.
 	if in.Env.Euid != 0 && !in.Env.HasNetRaw {
 		detail := "AF_XDP needs to create raw sockets and load an XDP program, which requires " +
