@@ -737,8 +737,13 @@ func (r *Runner) attach() error {
 
 	if r.io == "mlx5" {
 		// Direct Verbs: no program to attach, no filter, and nothing to reuse
-		// between runs, so none of the fleet machinery below applies.
-		frames := nextPow2(r.queues * (r.umemOptions().NumFrames))
+		// between runs, so none of the fleet machinery below applies. The
+		// frame region is the backend's to size -- it knows how many hardware
+		// rings sit behind each queue -- unless the user pinned a UMEM depth.
+		frames := 0
+		if r.numFrames != defaultNumFrames {
+			frames = nextPow2(r.queues * r.numFrames)
+		}
 		dev, steering, err := openMLX5(r.res.Link.Name, r.queues, r.frameSize, frames,
 			r.plan.Steering, !r.plan.Receives())
 		if err != nil {

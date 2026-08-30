@@ -8,10 +8,14 @@ import (
 	"github.com/atoonk/wireblast/internal/discovery"
 )
 
-// mlx5QueuesPerWorker is how many send queues one worker drives. A single
-// queue caps near 17 Mpps, well under a core, so a worker needs three or four
-// to saturate; measured, four beats one and eight is worse than four.
-const mlx5QueuesPerWorker = 4
+// mlx5QueuesPerWorker is how many send queues one worker drives. One: since
+// packetio started backing each transmit queue with its own fan-out of
+// hardware rings, a queue keeps a whole worker busy by itself, and one
+// worker per queue is the arrangement the backend is tuned for. (It used to
+// be four, when a single send queue capped near 17 Mpps; a worker driving
+// four of today's queues measures the same ~39 Mpps as driving one, from
+// one core instead of four queues' worth of hardware.)
+const mlx5QueuesPerWorker = 1
 
 // mlx5PerCore is what one worker sustains, in Mpps, at a given frame size.
 //

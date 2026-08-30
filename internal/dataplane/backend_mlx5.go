@@ -23,8 +23,10 @@ const mlx5Available = true
 func openMLX5(iface string, queues, frameSize, numFrames int, steering packetio.SteeringFilter, transmitOnly bool) (packetio.Device, string, error) {
 	opts := []mlx5.Option{
 		mlx5.WithTxQueues(queues),
-		mlx5.WithFrames(numFrames),
 		mlx5.WithFrameSize(frameSize),
+	}
+	if numFrames > 0 {
+		opts = append(opts, mlx5.WithFrames(numFrames))
 	}
 	if transmitOnly {
 		opts = append(opts, mlx5.WithRxQueues(0))
