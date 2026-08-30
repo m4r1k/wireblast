@@ -3,7 +3,7 @@ module github.com/atoonk/wireblast
 go 1.25.0
 
 require (
-	github.com/atoonk/go-afxdp v0.10.0
+	github.com/atoonk/go-afxdp v0.11.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
@@ -44,5 +44,3 @@ require (
 )
 
 replace github.com/atoonk/packetio => /home/ubuntu/packetio
-
-replace github.com/atoonk/go-afxdp => /home/ubuntu/go-afxdp
