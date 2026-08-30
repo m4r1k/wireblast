@@ -49,10 +49,51 @@ var mlx5PerCore = []struct {
 	{1518, 10.5},
 }
 
+// mlx5RxPerCore is what one worker sustains on the RECEIVE side, in Mpps, at
+// a given frame size -- a different curve from [mlx5PerCore], and the reason
+// a receiving run is sized separately.
+//
+// Receive costs more per core than transmit and gets worse as workers are
+// added, because they contend for the same card rather than each driving
+// their own send queues. Measured on a ConnectX-6 Dx under a 148.8 Mpps
+// flood of 64-byte frames, whole-machine cores: one worker takes 45.4 Mpps,
+// two 38.4 each, four 28.6, six 20.0, eight 18.2, ten 14.7 -- line rate at
+// ten workers (148.79 of 148.8 offered, twice), 99% of it at eight.
+//
+// The figures below are the eight-to-ten-worker end of that curve, which is
+// the part that decides whether a 100G receive reaches the wire; sizing from
+// the single-worker rate would ask for four workers and take 114.
+var mlx5RxPerCore = []struct {
+	frame int
+	mpps  float64
+}{
+	{68, 14.9},
+	{128, 12.0},
+	{512, 6.0},
+	{1518, 2.5},
+}
+
 // mlx5CoreRate interpolates [mlx5PerCore] at a frame size, clamped at both
 // ends.
 func mlx5CoreRate(frame int) float64 {
 	t := mlx5PerCore
+	if frame <= t[0].frame {
+		return t[0].mpps
+	}
+	for i := 1; i < len(t); i++ {
+		if frame > t[i].frame {
+			continue
+		}
+		lo, hi := t[i-1], t[i]
+		f := float64(frame-lo.frame) / float64(hi.frame-lo.frame)
+		return lo.mpps + f*(hi.mpps-lo.mpps)
+	}
+	return t[len(t)-1].mpps
+}
+
+// mlx5RxCoreRate is [mlx5CoreRate] for the receive curve.
+func mlx5RxCoreRate(frame int) float64 {
+	t := mlx5RxPerCore
 	if frame <= t[0].frame {
 		return t[0].mpps
 	}
@@ -116,7 +157,7 @@ func orUnknown(s string) string {
 // queue is the only arrangement that helps. mlx5 creates its own queues, so
 // the count is ours to pick: enough workers to cover line rate, and enough
 // queues each to keep a worker busy.
-func autoQueues(io string, cfg *config.Config, link discovery.Link, maxFrame int) (queues, perWorker int, why string) {
+func autoQueues(io string, cfg *config.Config, link discovery.Link, maxFrame int, receives bool) (queues, perWorker int, why string) {
 	perWorker = cfg.QueuesPerWorker
 	if io != "mlx5" {
 		// One queue per worker, and every queue the device has.
@@ -139,7 +180,7 @@ func autoQueues(io string, cfg *config.Config, link discovery.Link, maxFrame int
 		return cfg.Queues, perWorker, ""
 	}
 
-	workers, why := autoWorkers(link.SpeedMbps, maxFrame)
+	workers, why := autoWorkers(link.SpeedMbps, maxFrame, receives)
 	queues = workers * perWorker
 	if queues > maxAutoQueues {
 		queues = maxAutoQueues
@@ -149,22 +190,34 @@ func autoQueues(io string, cfg *config.Config, link discovery.Link, maxFrame int
 
 // autoWorkers is how many cores it takes to fill the link, from the line rate
 // at this frame size and what one worker was measured to do.
-func autoWorkers(speedMbps, frameLen int) (int, string) {
+func autoWorkers(speedMbps, frameLen int, receives bool) (int, string) {
 	cpus := max(runtime.NumCPU(), 1)
+	rate, side := mlx5CoreRate, "transmit"
+	if receives {
+		// A receiving run is sized from the receive curve, which is the
+		// expensive one: filling 100G takes ten workers where transmitting
+		// takes four, and sizing receive from the transmit curve is what
+		// made a bare receive run stop at 114 of 148.8 Mpps.
+		rate, side = mlx5RxCoreRate, "receive"
+	}
 	if speedMbps <= 0 || frameLen <= 0 {
-		// No carrier, or a device that reports no speed. Four workers fill
-		// 100G, which is the common case; --queues covers the rest.
-		return min(4, cpus), "link speed unknown, assuming 100G"
+		// No carrier, or a device that reports no speed. Assume 100G: four
+		// workers fill it transmitting, ten receiving.
+		n := 4
+		if receives {
+			n = 10
+		}
+		return min(n, cpus), "link speed unknown, assuming 100G"
 	}
 	// On the wire each frame also carries the preamble, the start-of-frame
 	// delimiter and the interframe gap: 20 bytes that cost time but are not
 	// in the frame.
 	lineMpps := float64(speedMbps) / float64((frameLen+20)*8)
-	workers := int(lineMpps/mlx5CoreRate(frameLen)) + 1
+	workers := int(lineMpps/rate(frameLen)) + 1
 	if workers > cpus {
 		workers = cpus
 	}
-	return max(workers, 1), fmt.Sprintf("sized for %s at %d-byte frames", speedLabel(speedMbps), frameLen)
+	return max(workers, 1), fmt.Sprintf("sized for %s %s at %d-byte frames", speedLabel(speedMbps), side, frameLen)
 }
 
 func speedLabel(mbps int) string {

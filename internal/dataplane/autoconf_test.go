@@ -32,7 +32,7 @@ func TestAutoWorkers(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, why := autoWorkers(tt.speed, tt.frame)
+			got, why := autoWorkers(tt.speed, tt.frame, false)
 			want := min(tt.want, cpus)
 			if got != want {
 				t.Errorf("autoWorkers(%d, %d) = %d, want %d", tt.speed, tt.frame, got, want)
@@ -76,9 +76,30 @@ func TestMLX5CoreRate(t *testing.T) {
 func TestAutoWorkersNeverExceedsCPUs(t *testing.T) {
 	// An implausibly fast link must not ask for more workers than there are
 	// cores to run them on.
-	got, _ := autoWorkers(8_000_000, 64)
+	got, _ := autoWorkers(8_000_000, 64, false)
 	if got > runtime.NumCPU() {
 		t.Errorf("autoWorkers = %d, more than %d CPUs", got, runtime.NumCPU())
+	}
+}
+
+// TestAutoWorkersReceiveIsBigger pins the reason the receive curve exists: a
+// receiving run on the same link and frame size must ask for more workers
+// than a transmitting one, because receive costs more per core. Sizing
+// receive from the transmit curve asked for four workers and took 114 of
+// 148.8 Mpps; ten is what reaches the wire.
+func TestAutoWorkersReceiveIsBigger(t *testing.T) {
+	cpus := runtime.NumCPU()
+	tx, _ := autoWorkers(100000, 68, false)
+	rx, _ := autoWorkers(100000, 68, true)
+	if want := min(10, cpus); rx != want {
+		t.Errorf("receive workers = %d, want %d", rx, want)
+	}
+	if cpus >= 10 && rx <= tx {
+		t.Errorf("receive %d workers is not more than transmit %d", rx, tx)
+	}
+	// An unknown link speed assumes 100G on both sides, and the same asymmetry.
+	if got, _ := autoWorkers(0, 68, true); got != min(10, cpus) {
+		t.Errorf("unknown speed receive = %d, want %d", got, min(10, cpus))
 	}
 }
 
@@ -87,21 +108,21 @@ func TestAutoQueuesAFXDP(t *testing.T) {
 
 	// AF_XDP binds every receive queue, one worker each, whatever the link
 	// speed says.
-	q, per, _ := autoQueues("afxdp", &config.Config{}, link, 64)
+	q, per, _ := autoQueues("afxdp", &config.Config{}, link, 64, false)
 	if q != 12 || per != 1 {
 		t.Errorf("got %d queues, %d per worker; want 12, 1", q, per)
 	}
 
 	// --queues caps it, and never raises it past what the device has.
-	if q, _, _ := autoQueues("afxdp", &config.Config{Queues: 4}, link, 64); q != 4 {
+	if q, _, _ := autoQueues("afxdp", &config.Config{Queues: 4}, link, 64, false); q != 4 {
 		t.Errorf("--queues 4: got %d, want 4", q)
 	}
-	if q, _, _ := autoQueues("afxdp", &config.Config{Queues: 99}, link, 64); q != 12 {
+	if q, _, _ := autoQueues("afxdp", &config.Config{Queues: 99}, link, 64, false); q != 12 {
 		t.Errorf("--queues 99: got %d, want 12", q)
 	}
 
 	// A device that reports no queues still gets one.
-	if q, _, _ := autoQueues("afxdp", &config.Config{}, discovery.Link{}, 64); q != 1 {
+	if q, _, _ := autoQueues("afxdp", &config.Config{}, discovery.Link{}, 64, false); q != 1 {
 		t.Errorf("no queues: got %d, want 1", q)
 	}
 }
@@ -112,7 +133,7 @@ func TestAutoQueuesMLX5(t *testing.T) {
 
 	// The NIC's own queue count is irrelevant: mlx5 creates its own, and the
 	// count comes from line rate. Four workers at four queues each.
-	q, per, why := autoQueues("mlx5", cfg, link, 68)
+	q, per, why := autoQueues("mlx5", cfg, link, 68, false)
 	if want := 4 * mlx5QueuesPerWorker; q != want || per != mlx5QueuesPerWorker {
 		t.Errorf("got %d queues, %d per worker; want %d, %d", q, per, want, mlx5QueuesPerWorker)
 	}
@@ -121,21 +142,21 @@ func TestAutoQueuesMLX5(t *testing.T) {
 	}
 
 	// Either flag overrides its half of the arithmetic.
-	if q, per, _ := autoQueues("mlx5", &config.Config{Queues: 7}, link, 68); q != 7 || per != mlx5QueuesPerWorker {
+	if q, per, _ := autoQueues("mlx5", &config.Config{Queues: 7}, link, 68, false); q != 7 || per != mlx5QueuesPerWorker {
 		t.Errorf("--queues 7: got %d, %d", q, per)
 	}
-	if q, per, _ := autoQueues("mlx5", &config.Config{QueuesPerWorker: 2}, link, 68); per != 2 || q != 8 {
+	if q, per, _ := autoQueues("mlx5", &config.Config{QueuesPerWorker: 2}, link, 68, false); per != 2 || q != 8 {
 		t.Errorf("--queues-per-worker 2: got %d queues, %d per worker; want 8, 2", q, per)
 	}
 
 	// A replay is paced and ordered per queue, so it keeps one queue per
 	// worker even on mlx5.
-	if _, per, _ := autoQueues("mlx5", &config.Config{PCAPFile: "x.pcap"}, link, 68); per != 1 {
+	if _, per, _ := autoQueues("mlx5", &config.Config{PCAPFile: "x.pcap"}, link, 68, false); per != 1 {
 		t.Errorf("pcap: got %d per worker, want 1", per)
 	}
 
 	// The derived count is bounded however fast the link claims to be.
-	if q, _, _ := autoQueues("mlx5", cfg, discovery.Link{SpeedMbps: 8_000_000}, 64); q > maxAutoQueues {
+	if q, _, _ := autoQueues("mlx5", cfg, discovery.Link{SpeedMbps: 8_000_000}, 64, false); q > maxAutoQueues {
 		t.Errorf("got %d queues, more than the %d cap", q, maxAutoQueues)
 	}
 }

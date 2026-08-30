@@ -280,7 +280,7 @@ func New(cfg *config.Config, res *discovery.Resolved, opts Options) (*Runner, er
 	// than at Start.
 	// maxFrame is bytes written, which excludes the FCS the NIC appends; line
 	// rate counts the whole frame, and so does --packet-size.
-	queues, perWorker, sizeWhy := autoQueues(io, cfg, res.Link, r.maxFrame+config.FCSLen)
+	queues, perWorker, sizeWhy := autoQueues(io, cfg, res.Link, r.maxFrame+config.FCSLen, r.plan.Receives())
 	r.queues, r.perWorker = queues, perWorker
 	if cfg.Transmits() {
 		if _, err := r.buildGenerators(); err != nil {
