@@ -1,7 +1,7 @@
 github.com/atoonk/go-afxdp v0.11.0 h1:WulG6KEPkdw8A/lbchrXRY/8xtqWc+0QWsjXkp9wN38=
 github.com/atoonk/go-afxdp v0.11.0/go.mod h1:ipiAvzdDnAivvbR/GbOvKgEQidjDGjkeIkv1Lv0aJVU=
-github.com/atoonk/packetio v0.0.0-20260831040713-2e37dc678682 h1:Oizm3b18dZjAmsRyLF1HyCNUYU+MfjqoFTay9sSsrY0=
-github.com/atoonk/packetio v0.0.0-20260831040713-2e37dc678682/go.mod h1:GnznXhfZMnXbabMYVNOa7twJYf7YVx5+ruD+ixbQIhg=
+github.com/atoonk/packetio v0.1.0 h1:Lyma2TkQ8zBvnfRofn3T9ikGtV2ci8HKQQJT4UlcJmM=
+github.com/atoonk/packetio v0.1.0/go.mod h1:GnznXhfZMnXbabMYVNOa7twJYf7YVx5+ruD+ixbQIhg=
 github.com/atotto/clipboard v0.1.4 h1:EH0zSVneZPSuFR11BlR9YppQTVDbh5+16AmcJi4g1z4=
 github.com/atotto/clipboard v0.1.4/go.mod h1:ZY9tmq7sm5xIbd9bOK4onWV4S6X0u6GY7Vn0Yu86PYI=
 github.com/aymanbagabas/go-osc52/v2 v2.0.1 h1:HwpRHbFMcZLEVr42D4p7XBqjyuxQH5SMiErDT4WkJ2k=

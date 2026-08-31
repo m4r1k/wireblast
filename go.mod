@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/atoonk/go-afxdp v0.11.0
-	github.com/atoonk/packetio v0.0.0-20260831040713-2e37dc678682
+	github.com/atoonk/packetio v0.1.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
