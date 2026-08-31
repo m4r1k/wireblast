@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/atoonk/go-afxdp v0.11.0
+	github.com/atoonk/packetio v0.0.0-20260831040713-2e37dc678682
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
@@ -14,7 +15,6 @@ require (
 )
 
 require (
-	github.com/atoonk/packetio v0.0.0
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/colorprofile v0.4.1 // indirect
@@ -42,5 +42,3 @@ require (
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 )
-
-replace github.com/atoonk/packetio => /home/ubuntu/packetio
