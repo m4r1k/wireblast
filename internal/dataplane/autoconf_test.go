@@ -130,12 +130,15 @@ func TestAutoQueuesAFXDP(t *testing.T) {
 func TestAutoQueuesMLX5(t *testing.T) {
 	link := discovery.Link{RxQueues: 48, SpeedMbps: 100000}
 	cfg := &config.Config{}
+	// autoWorkers never asks for more workers than there are cores, so the
+	// expectations here carry the same clamp as the rest of this file.
+	workers := min(5, runtime.NumCPU())
 
 	// The NIC's own queue count is irrelevant: mlx5 creates its own, and the
 	// count comes from line rate — five workers at 68 bytes, sized for the
 	// worst measured run.
 	q, per, why := autoQueues("mlx5", cfg, link, 68, false)
-	if want := 5 * mlx5QueuesPerWorker; q != want || per != mlx5QueuesPerWorker {
+	if want := workers * mlx5QueuesPerWorker; q != want || per != mlx5QueuesPerWorker {
 		t.Errorf("got %d queues, %d per worker; want %d, %d", q, per, want, mlx5QueuesPerWorker)
 	}
 	if why == "" {
@@ -146,8 +149,8 @@ func TestAutoQueuesMLX5(t *testing.T) {
 	if q, per, _ := autoQueues("mlx5", &config.Config{Queues: 7}, link, 68, false); q != 7 || per != mlx5QueuesPerWorker {
 		t.Errorf("--queues 7: got %d, %d", q, per)
 	}
-	if q, per, _ := autoQueues("mlx5", &config.Config{QueuesPerWorker: 2}, link, 68, false); per != 2 || q != 10 {
-		t.Errorf("--queues-per-worker 2: got %d queues, %d per worker; want 10, 2", q, per)
+	if q, per, _ := autoQueues("mlx5", &config.Config{QueuesPerWorker: 2}, link, 68, false); per != 2 || q != workers*2 {
+		t.Errorf("--queues-per-worker 2: got %d queues, %d per worker; want %d, 2", q, per, workers*2)
 	}
 
 	// A replay is paced and ordered per queue, so it keeps one queue per
