@@ -17,14 +17,14 @@ func TestAutoWorkers(t *testing.T) {
 	}{
 		// Each of these is a measured run: the worker count is the smallest
 		// that reached line rate on the rig at that frame size.
-		{"100G 68-byte", 100000, 68, 4},
+		{"100G 68-byte", 100000, 68, 5}, // sized for the worst measured run, so every run reaches the wire
 		{"100G 128-byte", 100000, 128, 3},
 		{"100G 256-byte", 100000, 256, 5}, // past the inline cliff
 		{"100G 512-byte", 100000, 512, 3},
 		{"100G jumbo", 100000, 1500, 1},
 		// Twice the link needs twice the workers. Extrapolated, not measured:
 		// the rig has no 200G card.
-		{"200G 68-byte", 200000, 68, 8},
+		{"200G 68-byte", 200000, 68, 9},
 		{"10G small", 10000, 68, 1},
 		// No carrier, or a device that reports no speed at all.
 		{"unknown speed", 0, 68, 4},
@@ -132,9 +132,10 @@ func TestAutoQueuesMLX5(t *testing.T) {
 	cfg := &config.Config{}
 
 	// The NIC's own queue count is irrelevant: mlx5 creates its own, and the
-	// count comes from line rate. Four workers at four queues each.
+	// count comes from line rate — five workers at 68 bytes, sized for the
+	// worst measured run.
 	q, per, why := autoQueues("mlx5", cfg, link, 68, false)
-	if want := 4 * mlx5QueuesPerWorker; q != want || per != mlx5QueuesPerWorker {
+	if want := 5 * mlx5QueuesPerWorker; q != want || per != mlx5QueuesPerWorker {
 		t.Errorf("got %d queues, %d per worker; want %d, %d", q, per, want, mlx5QueuesPerWorker)
 	}
 	if why == "" {
@@ -145,8 +146,8 @@ func TestAutoQueuesMLX5(t *testing.T) {
 	if q, per, _ := autoQueues("mlx5", &config.Config{Queues: 7}, link, 68, false); q != 7 || per != mlx5QueuesPerWorker {
 		t.Errorf("--queues 7: got %d, %d", q, per)
 	}
-	if q, per, _ := autoQueues("mlx5", &config.Config{QueuesPerWorker: 2}, link, 68, false); per != 2 || q != 8 {
-		t.Errorf("--queues-per-worker 2: got %d queues, %d per worker; want 8, 2", q, per)
+	if q, per, _ := autoQueues("mlx5", &config.Config{QueuesPerWorker: 2}, link, 68, false); per != 2 || q != 10 {
+		t.Errorf("--queues-per-worker 2: got %d queues, %d per worker; want 10, 2", q, per)
 	}
 
 	// A replay is paced and ordered per queue, so it keeps one queue per

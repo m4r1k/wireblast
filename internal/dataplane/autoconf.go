@@ -27,11 +27,17 @@ const mlx5QueuesPerWorker = 1
 // flat ~425 cycles however big it is. The cliff is between 196 and 200 bytes,
 // where the packet stops fitting the inline data segment.
 //
-// The figures are the measured single-worker rates shaded down about a tenth,
-// because a worker sharing the card with others runs slower than one alone —
-// 20.0 Mpps at 196 bytes becomes 18.2 once three are running. Rounding down
-// costs a core when the estimate is pessimistic; rounding up misses line rate,
-// which is the whole point of the default.
+// The figures are the measured single-worker rates shaded down, for two
+// reasons. A worker sharing the card with others runs slower than one alone —
+// 20.0 Mpps at 196 bytes becomes 18.2 once three are running. And a run's
+// per-packet cost is settled by an allocation lottery at startup: identical
+// runs on identical CPUs measure 136 to 155 cycles a packet (instructions
+// flat, IPC 5.4 to 4.8), depending on where that run's flow templates and
+// rings landed in physical memory. The table therefore carries the measured
+// WORST run, not the typical one: sizing from the good mode gave four
+// workers at 68 bytes, and one run in three missed line rate by 10%.
+// Rounding down costs a core when the estimate is pessimistic; missing the
+// wire on scheduler luck costs the default its whole point.
 //
 // This is one machine's curve, so it is a starting point rather than a law:
 // a different card or clock moves the numbers, and being a core out either way
@@ -41,7 +47,7 @@ var mlx5PerCore = []struct {
 	frame int     // bytes on the wire, including the FCS: what --packet-size means
 	mpps  float64 // one worker's rate at that size
 }{
-	{68, 39.0},
+	{68, 33.0}, // best runs do 35.4; the worst measured 31.3, and 33 sizes for it
 	{128, 31.0},
 	{160, 25.5},
 	{196, 18.0},
